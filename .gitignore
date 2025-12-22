@@ -1,24 +1,91 @@
-# folders or files
-datasets/*
-cubercnn/modeling/backbone/checkpoint_weights/*
-.vscode/
-.ipynb_checkpoints/
-.idea/
-output/
-cubercnn/external/
-slurm/
-datasets
-unused/
-checkpoints/
-ovmono3d_data/
-ovmono3d
-# filetypes
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 *.pyc
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Dataset files
+datasets/*
+!datasets/.gitkeep
+*.zip
+*.tar.gz
+*.json.backup
+
+# Model checkpoints and weights
+checkpoints/
+cubercnn/modeling/backbone/checkpoint_weights/*
+*.pth
+*.pkl
+*.ckpt
 *.mexa64
+
+# Training outputs
+output/
 */output/*
 */output*/*
-*~
-*.so
-*.ipynb
-*.pth
-*.zip
+logs/
+*.log
+wandb/
+tensorboard/
+ovmono3d_data/
+ovmono3d
+
+# External dependencies
+cubercnn/external/
+GroundingDINO/
+
+# Unused/archived
+unused/
+slurm/
+
+# Temporary files
+*.tmp
+*.bak
+wget-log
+*.cache
+
+# Large data files
+*.npz
+*.npy
+*.h5
+*.hdf5
+
+# OS
+.DS_Store
+Thumbs.db

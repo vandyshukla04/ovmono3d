@@ -1,0 +1,57 @@
+_BASE_: "Base.yaml"
+SOLVER:
+  TYPE: "sgd"
+  IMS_PER_BATCH: 4
+  BASE_LR: 0.001
+  STEPS: (6000, 8000)
+  MAX_ITER: 146000
+  WARMUP_ITERS: 500
+  CHECKPOINT_PERIOD: 500
+INPUT:
+  MIN_SIZE_TRAIN: (476, 504, 532, 560, 588, 616, 644)
+  MIN_SIZE_TEST: 560
+  MAX_SIZE_TRAIN: 756  # Changed from 768 (not divisible by 14)
+  MAX_SIZE_TEST: 756
+  FORMAT: "RGB"
+TEST:
+  EVAL_PERIOD: 500
+  CAT_MODE: 'novel'
+  ORACLE2D: False  # Add this line
+VIS_PERIOD: 100
+DATASETS:
+  TRAIN: ('RHINO_train',)
+  TEST: ('RHINO_test',)
+  TEST_NOVEL: ('RHINO_test',)
+  TEST_BASE: ()
+  CATEGORY_NAMES: ('rhino',)
+  CATEGORY_NAMES_NOVEL: ('rhino',)
+  CATEGORY_NAMES_BASE: ()
+MODEL:
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]
+  WEIGHTS: "/home/shuklva/ovmono3d/checkpoints/ovmono3d_lift.pth"
+  BACKBONE:
+    FREEZE_AT: 2
+    NAME: 'build_dino_backbone'
+  DINO:
+    NAME: 'dinov2'
+    MODEL_NAME: 'vitb14'
+    OUTPUT: 'dense'
+    LAYER: -1
+    RETURN_MULTILAYER: False
+  FPN:
+    IN_FEATURE: 'last_feat'
+    NORM: 'LN'
+    SQUARE_PAD: 756  # Must be divisible by 14
+  ANCHOR_GENERATOR:
+    SIZES: [[64], [128], [256]]
+  RPN:
+    IN_FEATURES: ['p2', 'p3', 'p4']
+  ROI_HEADS:
+    NUM_CLASSES: 1
+    IN_FEATURES: ['p2', 'p3', 'p4']
+  ROI_CUBE_HEAD:
+    LOSS_W_3D: 1.0
+OUTPUT_DIR: "./output/rhino_cubercnn_b4_ovmono_ckpt"
+DATALOADER:
+  NUM_WORKERS: 1

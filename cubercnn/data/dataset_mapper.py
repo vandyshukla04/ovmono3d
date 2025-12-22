@@ -43,8 +43,8 @@ class DatasetMapper3D(DatasetMapper):
             dataset_id = dataset_dict['dataset_id']
             K = np.array(dataset_dict['K'])
 
-            unknown_categories = self.dataset_id_to_unknown_cats[dataset_id]
-
+            # unknown_categories = self.dataset_id_to_unknown_cats[dataset_id]
+            unknown_categories = self.dataset_id_to_unknown_cats.get(dataset_id, [])
             # transform and pop off annotations
             annos = [
                 transform_instance_annotations(obj, transforms, K=K)
@@ -146,8 +146,14 @@ def annotations_to_instances(annos, image_size, unknown_categories):
     # do keypoints?
     target.gt_keypoints = Keypoints(torch.FloatTensor([anno['keypoints'] for anno in annos]))
 
-    gt_unknown_category_mask = torch.zeros(max(unknown_categories)+1, dtype=bool)
-    gt_unknown_category_mask[torch.tensor(list(unknown_categories))] = True
+    # gt_unknown_category_mask = torch.zeros(max(unknown_categories)+1, dtype=bool)
+
+    if unknown_categories:
+        gt_unknown_category_mask = torch.zeros(max(unknown_categories)+1, dtype=bool)
+        for unknown_cat_id in unknown_categories:
+            gt_unknown_category_mask[unknown_cat_id] = True
+    else:
+        gt_unknown_category_mask = torch.zeros(1, dtype=bool)
 
     # include available category indices as tensor with GTs
     target.gt_unknown_category_mask = gt_unknown_category_mask.unsqueeze(0).repeat([n, 1])

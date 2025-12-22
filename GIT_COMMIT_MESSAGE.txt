@@ -1,0 +1,63 @@
+Reorganize RHINO tools and cleanup project structure
+
+Major cleanup and reorganization to improve RHINO dataset workflow:
+
+## New Features
+- Create unified prepare_rhino_dataset.py pipeline
+  * Replaces 5+ manual fix scripts with single command
+  * Automatic validation of generated data
+  * Proper error handling and progress reporting
+- Add verify_installation.py to check setup
+- Create comprehensive documentation suite
+
+## Project Structure Changes
+- Create rhino_tools/ directory for organized RHINO tooling
+- Move all RHINO scripts from root to rhino_tools/
+- Archive legacy scripts in rhino_tools/legacy/
+- Add proper __init__.py and package structure
+
+## Cleanup
+- Remove duplicate files (fix_category_.py, LICENSE.md)
+- Remove temporary files (wget-log)
+- Remove empty directories (rhino_scripts/)
+- Update .gitignore with comprehensive patterns
+
+## Bug Fixes
+- Fix dataset_mapper.py KeyError for new datasets
+  * Changed from dict access to .get() with default
+  * Prevents crashes when adding new dataset types
+- Fix unknown_categories handling for empty lists
+
+## Documentation
+- Add QUICK_START.md - one-page quick reference
+- Add RHINO_TRAINING_GUIDE.md - complete training guide
+- Add CLEANUP_SUMMARY.md - detailed cleanup documentation
+- Add rhino_tools/README.md - tool-specific docs
+- Add output/README.md - training output organization
+- Add rhino_tools/legacy/README.md - legacy script explanation
+
+## Benefits
+Before:
+- 8 scripts scattered in root directory
+- Multi-step manual workflow prone to errors
+- No validation or error checking
+- Unclear execution order
+- Poor documentation
+
+After:
+- Organized rhino_tools/ package
+- Single comprehensive pipeline command
+- Automatic validation built-in
+- Clear documentation at every level
+- Professional project structure
+
+Files changed:
+- Modified: .gitignore, cubercnn/data/dataset_mapper.py
+- Added: QUICK_START.md, RHINO_TRAINING_GUIDE.md, CLEANUP_SUMMARY.md
+- Added: rhino_tools/ (complete package)
+- Added: output/README.md
+- Removed: fix_category_.py, wget-log, LICENSE.md, rhino_scripts/
+
+This reorganization eliminates the "two steps forward, one step back"
+workflow issue and makes the RHINO dataset preparation reliable and
+reproducible.
