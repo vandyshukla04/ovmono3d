@@ -219,9 +219,18 @@ def get_cfg_defaults(cfg):
     cfg.TEST.VISIBILITY_THRES = 1/2.0
     cfg.TEST.TRUNCATION_THRES = 1/2.0
 
-    # If ORACLE2D is True, the ocacle 2d bboxes and categories will be loaded when evaluation. 
+    # If ORACLE2D is True, the ocacle 2d bboxes and categories will be loaded when evaluation.
     cfg.TEST.ORACLE2D = True
     cfg.TEST.CAT_MODE = "base" # "base" or "novel" or "all"
+
+    # Relative Layout AP3D (LabelAny3D paper, Sec. 5.1). When True, a second
+    # 3D AP pass is run after the normal AP3D in which all predicted cuboids
+    # are multiplied by a single global scale factor chosen by grid search to
+    # maximize mean IoU3D vs. ground truth. Used for non-metric fine-tuning
+    # where absolute scale is not meaningful.
+    cfg.TEST.EVAL_REL_AP3D = False
+    # Grid for the scale search: linspace(min, max, num).
+    cfg.TEST.REL_AP3D_SEARCH = (0.3, 3.0, 28)
 
     cfg.INPUT.RANDOM_FLIP = "horizontal"
     cfg.INPUT.TRAIN_SET_PERCENTAGE = 1.0

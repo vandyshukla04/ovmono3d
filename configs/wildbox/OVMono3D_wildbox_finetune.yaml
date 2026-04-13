@@ -1,0 +1,64 @@
+_BASE_: "../OVMono3D_dinov2_SFP.yaml"
+MODEL:
+  # Load weights only, no optimizer/scheduler state (fine-tune).
+  WEIGHTS_PRETRAIN: "checkpoints/ovmono3d_lift.pth"
+  WEIGHTS: ""
+  ROI_HEADS:
+    # Keep 50 to avoid shape mismatch against the pretrained head. Our
+    # giraffe category is mapped into a contiguous id slot via stats.json.
+    NUM_CLASSES: 50
+  ROI_CUBE_HEAD:
+    # Our Z is synthetic scale (VGGT native units scaled so median |Z| = 1).
+    # Disabling virtual depth keeps the loss in that synthetic space.
+    VIRTUAL_DEPTH: False
+    # Down-weight Z: its absolute magnitude is arbitrary, so the gradient
+    # shouldn't dominate dims/pose/xy.
+    LOSS_W_Z: 0.5
+    LOSS_W_DIMS: 1.0
+    LOSS_W_POSE: 1.0
+    LOSS_W_XY: 1.0
+  FPN:
+    # Reduce memory: frames are 518x294 so we don't need 896-square pad.
+    SQUARE_PAD: 560
+SOLVER:
+  TYPE: "sgd"
+  IMS_PER_BATCH: 4
+  BASE_LR: 0.001
+  STEPS: (3000, 4500)
+  MAX_ITER: 5000
+  WARMUP_ITERS: 200
+  CHECKPOINT_PERIOD: 1000
+TEST:
+  EVAL_PERIOD: 1000
+  # Run the Relative Layout AP3D metric after each normal AP3D pass.
+  # This is the number to compare before vs. after fine-tuning.
+  EVAL_REL_AP3D: True
+  REL_AP3D_SEARCH: (0.1, 5.0, 50)
+  # Force the class-agnostic open-vocab code path at eval time.
+  CAT_MODE: "novel"
+DATASETS:
+  TRAIN: ('WildBox_train',)
+  # DATASETS.TEST is unused by do_test; TEST_NOVEL/TEST_BASE are the ones
+  # that actually get read. We point both at the same val so that the
+  # unconditional mode='base' call at train_net.py:453 doesn't crash.
+  TEST: ('WildBox_val',)
+  TEST_NOVEL: ('WildBox_val',)
+  TEST_BASE: ('WildBox_val',)
+  CATEGORY_NAMES: ('giraffe',)
+  CATEGORY_NAMES_NOVEL: ('giraffe',)
+  CATEGORY_NAMES_BASE: ('giraffe',)
+  IGNORE_NAMES: []
+  TRUNCATION_THRES: 0.99
+  VISIBILITY_THRES: 0.01
+  MIN_HEIGHT_THRES: 0.0
+  MAX_DEPTH: 1.0e8
+  MODAL_2D_BOXES: False
+  TRUNC_2D_BOXES: False
+INPUT:
+  # Our frames are 518x294 (VGGT resized). Sweep around that resolution.
+  MIN_SIZE_TRAIN: (280, 308, 336, 364, 392)
+  MIN_SIZE_TEST: 294
+  MAX_SIZE_TRAIN: 560
+  MAX_SIZE_TEST: 560
+VIS_PERIOD: 500
+OUTPUT_DIR: "output/ovmono3d_wildbox_finetune_phase1"

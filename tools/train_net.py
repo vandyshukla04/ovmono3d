@@ -73,12 +73,14 @@ def do_test(cfg, model, iteration='final', storage=None, mode="novel"):
     output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", 'iter_{}'.format(iteration))
 
     eval_helper = Omni3DEvaluationHelper(
-        dataset_names_test, 
-        filter_settings, 
-        output_folder, 
+        dataset_names_test,
+        filter_settings,
+        output_folder,
         iter_label=iteration,
         only_2d=only_2d,
-        eval_categories = eval_categories
+        eval_categories=eval_categories,
+        eval_rel_ap3d=cfg.TEST.EVAL_REL_AP3D,
+        rel_ap3d_search=tuple(cfg.TEST.REL_AP3D_SEARCH),
     )
     
     for dataset_name in dataset_names_test:

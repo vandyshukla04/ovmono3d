@@ -191,13 +191,15 @@ def calculate_metrics(results_cat, categories):
     return metrics
 
 class Omni3DEvaluationHelper:
-    def __init__(self, 
-            dataset_names, 
-            filter_settings, 
+    def __init__(self,
+            dataset_names,
+            filter_settings,
             output_folder,
             iter_label='-',
             only_2d=False,
-            eval_categories=None
+            eval_categories=None,
+            eval_rel_ap3d=False,
+            rel_ap3d_search=(0.3, 3.0, 28),
         ):
         """
         A helper class to initialize, evaluate and summarize Omni3D metrics. 
@@ -226,6 +228,8 @@ class Omni3DEvaluationHelper:
         self.output_folder = output_folder
         self.iter_label = iter_label
         self.only_2d = only_2d
+        self.eval_rel_ap3d = eval_rel_ap3d
+        self.rel_ap3d_search = rel_ap3d_search
 
         # Each dataset evaluator is stored here
         self.evaluators = OrderedDict()
@@ -258,10 +262,12 @@ class Omni3DEvaluationHelper:
             
             # create an individual dataset evaluator
             self.evaluators[dataset_name] = Omni3DEvaluator(
-                dataset_name, output_dir=self.output_folders[dataset_name], 
-                filter_settings=filter_settings, only_2d=self.only_2d, 
+                dataset_name, output_dir=self.output_folders[dataset_name],
+                filter_settings=filter_settings, only_2d=self.only_2d,
                 eval_prox=('Objectron' in dataset_name or 'SUNRGBD' in dataset_name),
                 distributed=False, # actual evaluation should be single process
+                eval_rel_ap3d=self.eval_rel_ap3d,
+                rel_ap3d_search=self.rel_ap3d_search,
             )
 
             self.evaluators[dataset_name].reset()
@@ -349,6 +355,8 @@ class Omni3DEvaluationHelper:
                     self.evals_nhd_accumulators3D[key] = []
                 self.evals_nhd_accumulators3D[key] += item
             logger.info('\n'+results['log_str_3D'].replace('mode=3D', '{} iter={} mode=3D'.format(dataset_name, self.iter_label)))
+            if 'log_str_3D-Rel' in results:
+                logger.info('\n'+results['log_str_3D-Rel'].replace('mode=3D', '{} iter={} mode=3D-Rel'.format(dataset_name, self.iter_label)))
 
         # full model category names
         category_names = self.filter_settings['category_names']
@@ -745,6 +753,8 @@ class Omni3DEvaluator(COCOEvaluator):
         eval_prox=False,
         only_2d=False,
         filter_settings={},
+        eval_rel_ap3d=False,
+        rel_ap3d_search=(0.3, 3.0, 28),
     ):
         """
         Args:
@@ -785,6 +795,8 @@ class Omni3DEvaluator(COCOEvaluator):
         self._eval_prox = eval_prox
         self._only_2d = only_2d
         self._filter_settings = filter_settings
+        self._eval_rel_ap3d = eval_rel_ap3d
+        self._rel_ap3d_search = rel_ap3d_search
 
         # COCOeval requires the limit on the number of detections per image (maxDets) to be a list
         # with at least 3 elements. The default maxDets in COCOeval is [1, 10, 100], in which the
@@ -865,11 +877,12 @@ class Omni3DEvaluator(COCOEvaluator):
         Returns:
             a dict of {metric name: score}
         """
-        assert mode in ["2D", "3D"]
+        assert mode in ["2D", "3D", "3D-Rel"]
 
         metrics = {
             "2D": ["AP", "AP50", "AP75", "AP95", "APs", "APm", "APl", "AR1", "AR10", "AR100",],
             "3D": ["AP", "AP15", "AP25", "AP50", "APn", "APm", "APf", "AR1", "AR10", "AR100",],
+            "3D-Rel": ["AP", "AP15", "AP25", "AP50", "APn", "APm", "APf", "AR1", "AR10", "AR100",],
         }[mode]
 
         if iou_type != "bbox":
@@ -1020,6 +1033,8 @@ class Omni3DEvaluator(COCOEvaluator):
                     img_ids=img_ids,
                     only_2d=self._only_2d,
                     eval_prox=self._eval_prox,
+                    eval_rel_ap3d=self._eval_rel_ap3d,
+                    rel_ap3d_search=self._rel_ap3d_search,
                 )
                 if len(omni_results) > 0
                 else None  # cocoapi does not handle empty results very well
@@ -1039,9 +1054,11 @@ class Omni3DEvaluator(COCOEvaluator):
                 if mode == "3D":
                     self._results[task + "_" + format(mode) + '_nhd_accumulators'] = evals[mode].eval["nhd_accumulators"]
             self._results["log_str_2D"] = log_strs["2D"]
-            
+
             if "3D" in log_strs:
                 self._results["log_str_3D"] = log_strs["3D"]
+            if "3D-Rel" in log_strs:
+                self._results["log_str_3D-Rel"] = log_strs["3D-Rel"]
 
 
 def _evaluate_predictions_on_omni(
@@ -1051,6 +1068,8 @@ def _evaluate_predictions_on_omni(
     img_ids=None,
     only_2d=False,
     eval_prox=False,
+    eval_rel_ap3d=False,
+    rel_ap3d_search=(0.3, 3.0, 28),
 ):
     """
     Evaluate the coco results using COCOEval API.
@@ -1074,6 +1093,24 @@ def _evaluate_predictions_on_omni(
         log_str = omni_eval.summarize()
         log_strs[mode] = log_str
         evals[mode] = omni_eval
+
+    # Relative Layout AP3D: a second 3D pass in which every predicted cuboid
+    # is multiplied by a globally-searched scalar. Used for non-metric
+    # fine-tuning where absolute scale is meaningless.
+    if not only_2d and eval_rel_ap3d:
+        rel_eval = Omni3DevalWithNHD(
+            omni_gt, omni_dt, iou_threshold_for_disentangled_metrics=0.75,
+            iouType=iou_type, mode="3D", eval_prox=eval_prox,
+        )
+        if img_ids is not None:
+            rel_eval.params.imgIds = img_ids
+        lo, hi, n = rel_ap3d_search
+        rel_eval.search_rel_scale(scale_grid=np.linspace(float(lo), float(hi), int(n)))
+        rel_eval.evaluate()
+        rel_eval.accumulate()
+        rel_log_str = rel_eval.summarize()
+        log_strs["3D-Rel"] = rel_log_str
+        evals["3D-Rel"] = rel_eval
 
     return evals, log_strs
 
@@ -1248,6 +1285,12 @@ class Omni3Deval(COCOeval):
 
         self.evals_per_cat_area = None
 
+        # Relative Layout AP3D: when set to a value != 1.0, every predicted
+        # 3D bbox (8-corner) is multiplied by this scalar before IoU. Used
+        # to evaluate models trained in a non-metric synthetic space. See
+        # search_rel_scale() below and cfg.TEST.EVAL_REL_AP3D.
+        self.rel_scale = 1.0
+
     def _prepare(self):
         """
         Prepare ._gts and ._dts for evaluation based on params
@@ -1279,6 +1322,87 @@ class Omni3Deval(COCOeval):
 
         self.evalImgs = defaultdict(list)  # per-image per-category evaluation results
         self.eval = {}  # accumulated evaluation results
+
+    def search_rel_scale(self, scale_grid=None):
+        """
+        Grid search a single global scale factor that maximizes the sum of
+        IoU3D across all (image, category) pairs. Stores the winner into
+        self.rel_scale so that subsequent computeIoU calls rescale
+        predictions accordingly.
+
+        This is the Relative Layout AP3D metric from the LabelAny3D paper
+        (Sec. 5.1). Only meaningful when mode == "3D".
+        """
+        assert self.mode == "3D", "search_rel_scale only applies to 3D mode"
+
+        # Populate _gts / _dts without running the full evaluate() loop.
+        self._prepare()
+
+        if scale_grid is None:
+            scale_grid = np.linspace(0.3, 3.0, 28)
+        else:
+            scale_grid = np.asarray(scale_grid, dtype=np.float64)
+
+        p = self.params
+        cat_ids = p.catIds if p.useCats else [-1]
+
+        # Collect all (dt_corners, gt_corners) pairs that would be compared.
+        dt_list, gt_list, pair_index = [], [], []
+        for img_id in p.imgIds:
+            for cat_id in cat_ids:
+                gts = self._gts[img_id, cat_id]
+                dts = self._dts[img_id, cat_id]
+                if not gts or not dts:
+                    continue
+                g = [gt["bbox3D"] for gt in gts]
+                d = [dt["bbox3D"] for dt in dts]
+                pair_index.append((len(dt_list), len(dt_list) + len(d),
+                                   len(gt_list), len(gt_list) + len(g)))
+                dt_list.extend(d)
+                gt_list.extend(g)
+
+        if not dt_list or not gt_list:
+            print("[rel_ap3d] no overlapping gt/dt pairs; keeping rel_scale = 1.0")
+            self.rel_scale = 1.0
+            return 1.0
+
+        device = (torch.device("cuda:0") if torch.cuda.is_available()
+                  else torch.device("cpu"))
+        dd_all = torch.tensor(dt_list, device=device, dtype=torch.float32)
+        gg_all = torch.tensor(gt_list, device=device, dtype=torch.float32)
+
+        best_score = -1.0
+        best_scale = 1.0
+        for s in scale_grid:
+            try:
+                ious_matrix = box3d_overlap(dd_all * float(s), gg_all).cpu().numpy()
+            except Exception as e:
+                print(f"[rel_ap3d] box3d_overlap failed at s={s}: {e}")
+                continue
+
+            score = 0.0
+            for (d0, d1, g0, g1) in pair_index:
+                block = ious_matrix[d0:d1, g0:g1]
+                if block.size == 0:
+                    continue
+                # Best IoU per GT (greedy, matches APs intuition).
+                score += float(block.max(axis=0).sum())
+
+            if score > best_score:
+                best_score = score
+                best_scale = float(s)
+
+        print(f"[rel_ap3d] best global scale = {best_scale:.4f} "
+              f"(sum of per-gt max IoU = {best_score:.3f})")
+        self.rel_scale = best_scale
+
+        # Reset state so the caller's evaluate() recomputes from scratch.
+        self._gts = defaultdict(list)
+        self._dts = defaultdict(list)
+        self.evalImgs = defaultdict(list)
+        self.eval = {}
+
+        return best_scale
 
     def accumulate(self, p = None):
         '''
@@ -1527,6 +1651,12 @@ class Omni3Deval(COCOeval):
             
             dd = torch.tensor(d, device=device, dtype=torch.float32)
             gg = torch.tensor(g, device=device, dtype=torch.float32)
+
+            # Relative Layout AP3D: rescale predicted corners by a single
+            # global factor chosen to maximise mean IoU3D. rel_scale stays
+            # at 1.0 in the default code path.
+            if self.mode == "3D" and self.rel_scale != 1.0:
+                dd = dd * self.rel_scale
 
             ious = box3d_overlap(dd, gg).cpu().numpy()
 
