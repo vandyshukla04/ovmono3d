@@ -405,13 +405,17 @@ def build_annotation(
 
 def build_split_json(
     segments: List[Dict],
-    category_name: str,
-    category_id: int,
+    species_map: Dict[str, Tuple[str, int]],
     dataset_id: int,
     dataset_name: str,
     image_root_prefix: str,
 ) -> Tuple[Dict, Dict[str, float]]:
-    """Build one Omni3D-style dict from a list of segments."""
+    """Build one Omni3D-style dict from a list of segments.
+
+    species_map maps the folder name under --root (e.g. 'rhinos') to a
+    (category_name, category_id) tuple. Segments whose species isn't in
+    the map are dropped with a warning.
+    """
     images = []
     annotations = []
     scene_scales = {}
@@ -420,6 +424,13 @@ def build_split_json(
     next_ann_id = 0
 
     for seg in segments:
+        sp_key = seg["species"]
+        if sp_key not in species_map:
+            logger.warning(f"Skipping segment {seg['seg_id']} — species "
+                           f"'{sp_key}' not in --species-map")
+            continue
+        category_name, category_id = species_map[sp_key]
+
         loaded = load_segment(seg)
         if loaded is None:
             continue
@@ -479,6 +490,7 @@ def build_split_json(
                 annotations.append(ann)
                 next_ann_id += 1
 
+    category_ids_used = sorted({cid for _, cid in species_map.values()})
     data = {
         "info": {
             "id": dataset_id,
@@ -487,14 +499,13 @@ def build_split_json(
             "split": dataset_name.split("_")[-1],
             "version": "1.0",
             "url": "",
-            "known_category_ids": [category_id],
+            "known_category_ids": category_ids_used,
             "scene_scales": scene_scales,
         },
-        "categories": [{
-            "id": category_id,
-            "name": category_name,
-            "supercategory": "animal",
-        }],
+        "categories": [
+            {"id": cid, "name": name, "supercategory": "animal"}
+            for name, cid in sorted(species_map.values(), key=lambda x: x[1])
+        ],
         "images": images,
         "annotations": annotations,
     }
@@ -506,8 +517,12 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", type=Path, required=True,
                    help="WildBox videos root, e.g. /mnt/d/3DBOX/Data/videos/202401_Kenya")
-    p.add_argument("--species", nargs="+", required=True,
-                   help="Species subfolder names under --root, e.g. giraffes")
+    p.add_argument("--species-map", nargs="+", required=True,
+                   help="Per-species mapping 'folder=category:category_id'. "
+                        "Example: 'giraffes=giraffe:1000' 'rhinos=rhino:1004' "
+                        "'elephants=elephant:1002'. The folder is the dir under "
+                        "--root; category name + id must match stats.json after "
+                        "running tools/patch_stats_for_wildbox.py.")
     p.add_argument("--train-segments", nargs="+", default=[],
                    help="Segment ids (video/seg) to place in the train split")
     p.add_argument("--val-segments", nargs="+", default=[],
@@ -516,10 +531,6 @@ def parse_args():
                    default=Path("datasets/Omni3D/WildBox_train.json"))
     p.add_argument("--output-val", type=Path,
                    default=Path("datasets/Omni3D/WildBox_val.json"))
-    p.add_argument("--category", default="giraffe",
-                   help="Omni3D category name to assign to every box")
-    p.add_argument("--category-id", type=int, default=1000,
-                   help="Omni3D category id (keep outside 0-49 to avoid collision)")
     p.add_argument("--dataset-id", type=int, default=1000,
                    help="Omni3D dataset id for the info section")
     p.add_argument("--image-root-prefix", default="WildBox",
@@ -529,6 +540,24 @@ def parse_args():
     return p.parse_args()
 
 
+def parse_species_map(entries: List[str]) -> Dict[str, Tuple[str, int]]:
+    """Parse ['giraffes=giraffe:1000', 'rhinos=rhino:1004'] into a dict."""
+    out: Dict[str, Tuple[str, int]] = {}
+    for entry in entries:
+        if "=" not in entry or ":" not in entry:
+            raise SystemExit(f"--species-map entry '{entry}' must be "
+                             f"'folder=category:category_id'")
+        folder, _, spec = entry.partition("=")
+        name, _, cid_str = spec.partition(":")
+        try:
+            cid = int(cid_str)
+        except ValueError:
+            raise SystemExit(f"--species-map: '{cid_str}' in '{entry}' "
+                             f"is not an integer")
+        out[folder] = (name, cid)
+    return out
+
+
 def main():
     args = parse_args()
     logging.basicConfig(
@@ -536,9 +565,12 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    all_segments = discover_segments(args.root, args.species)
+    species_map = parse_species_map(args.species_map)
+    species_folders = list(species_map.keys())
+
+    all_segments = discover_segments(args.root, species_folders)
     logger.info(f"Discovered {len(all_segments)} segments under "
-                f"{args.root} species={args.species}")
+                f"{args.root} species={species_folders}")
     if not all_segments:
         sys.exit(2)
 
@@ -563,8 +595,7 @@ def main():
             continue
         data, scales = build_split_json(
             segments=segs,
-            category_name=args.category,
-            category_id=args.category_id,
+            species_map=species_map,
             dataset_id=args.dataset_id,
             dataset_name=f"WildBox_{split_name}",
             image_root_prefix=args.image_root_prefix,

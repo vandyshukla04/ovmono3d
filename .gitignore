@@ -22,3 +22,4 @@ ovmono3d
 *.ipynb
 *.pth
 *.zip
+debug/*
