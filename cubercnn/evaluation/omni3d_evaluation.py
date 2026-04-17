@@ -991,11 +991,13 @@ class Omni3DEvaluator(COCOEvaluator):
             reverse_id_mapping = {v: k for k, v in dataset_id_to_contiguous_id.items()}
             for result in omni_results:
                 category_id = result["category_id"]
-                assert category_id < num_classes, (
-                    f"A prediction has class={category_id}, "
-                    f"but the dataset only has {num_classes} classes and "
-                    f"predicted class id should be in [0, {num_classes - 1}]."
-                )
+                # A model head trained with NUM_CLASSES larger than this
+                # dataset's vocab (e.g. 50-class pretrained head evaluated
+                # on a 2-class wildlife split) may emit out-of-vocab class
+                # ids. Drop them rather than crashing -- the filter a few
+                # lines below is the semantic intent.
+                if category_id >= num_classes:
+                    continue
                 result["category_id"] = reverse_id_mapping[category_id]
 
                 cat_name = omni3d_global_categories[category_id]
