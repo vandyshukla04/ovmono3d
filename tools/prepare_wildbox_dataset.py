@@ -74,6 +74,7 @@ import os
 import random
 import struct
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -81,6 +82,57 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger("prepare_wildbox_dataset")
+
+
+def resolve_source_path(path: Path) -> Path:
+    """Resolve a --source path. If it points at a .zip, auto-extract to a
+    sibling directory `<name>_unzipped/` and return that directory. Idempotent:
+    if the sibling directory already exists, skip extraction.
+
+    Heuristic for finding <video>/<seg>/vggt_results/ inside the zip:
+      1. If the extracted root directly contains <video>/<seg>/vggt_results, use it.
+      2. Otherwise, descend into single-child directories until we find one
+         whose grandchildren contain vggt_results. That handles zips wrapped
+         in a redundant top-level folder (the common case with
+         `zip -r archive.zip folder/`).
+    """
+    if path.is_dir():
+        return path
+    if path.is_file() and path.suffix.lower() == ".zip":
+        extract_dir = path.with_name(path.stem + "_unzipped")
+        if not extract_dir.exists():
+            logger.info(f"Extracting {path} -> {extract_dir}")
+            extract_dir.mkdir(parents=True, exist_ok=False)
+            try:
+                with zipfile.ZipFile(path, "r") as zf:
+                    zf.extractall(extract_dir)
+            except Exception:
+                # If extraction fails partway, remove the partial dir so the
+                # next run starts clean instead of using broken data.
+                import shutil
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                raise
+        else:
+            logger.info(f"Reusing existing extraction: {extract_dir}")
+
+        # Try to find the real data root (skip wrapper dirs).
+        candidate = extract_dir
+        for _ in range(5):  # bound the descent to avoid infinite loops
+            # Does candidate already contain <video>/<seg>/vggt_results?
+            for video_dir in candidate.iterdir() if candidate.is_dir() else []:
+                if not video_dir.is_dir():
+                    continue
+                for seg_dir in video_dir.iterdir():
+                    if seg_dir.is_dir() and (seg_dir / "vggt_results").exists():
+                        return candidate
+            # Otherwise, if there's exactly one subdirectory, descend.
+            subdirs = [p for p in candidate.iterdir() if p.is_dir()] if candidate.is_dir() else []
+            if len(subdirs) == 1:
+                candidate = subdirs[0]
+                continue
+            break
+        return candidate
+    raise SystemExit(f"--source path does not exist or is not a .zip: {path}")
 
 
 @dataclass
@@ -511,7 +563,13 @@ def auto_split(segments: List[Dict], mode: str, val_fraction: float,
 
 
 def parse_source(entry: str) -> Source:
-    """Parse 'path=category:category_id' into a Source."""
+    """Parse 'path=category:category_id' into a Source.
+
+    `path` may be a directory containing <video>/<seg>/vggt_results/,
+    or a .zip archive whose content (possibly under a single wrapper
+    directory) has that structure. Zips are auto-extracted to a
+    sibling `<name>_unzipped/` directory on first use.
+    """
     if "=" not in entry or ":" not in entry:
         raise SystemExit(f"--source entry '{entry}' must be "
                          f"'path=category:category_id'")
@@ -521,8 +579,9 @@ def parse_source(entry: str) -> Source:
         cid = int(cid_str)
     except ValueError:
         raise SystemExit(f"--source: '{cid_str}' in '{entry}' is not an integer")
-    return Source(path=Path(path_str).expanduser(),
-                  category_name=name, category_id=cid)
+    raw = Path(path_str).expanduser()
+    resolved = resolve_source_path(raw)
+    return Source(path=resolved, category_name=name, category_id=cid)
 
 
 def parse_args():

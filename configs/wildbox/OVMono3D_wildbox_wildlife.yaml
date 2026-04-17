@@ -1,0 +1,16 @@
+_BASE_: "OVMono3D_wildbox_finetune.yaml"
+DATASETS:
+  CATEGORY_NAMES: ('rhino', 'elephant', 'zebra')
+  CATEGORY_NAMES_NOVEL: ('rhino', 'elephant', 'zebra')
+  CATEGORY_NAMES_BASE: ('rhino', 'elephant', 'zebra')
+SOLVER:
+  # Longer schedule for 3-class training; step-downs at 60% and 90%.
+  IMS_PER_BATCH: 4
+  BASE_LR: 0.001
+  MAX_ITER: 15000
+  STEPS: (9000, 13500)
+  WARMUP_ITERS: 500
+  CHECKPOINT_PERIOD: 2000
+TEST:
+  EVAL_PERIOD: 2000
+OUTPUT_DIR: "output/ovmono3d_wildbox_wildlife"

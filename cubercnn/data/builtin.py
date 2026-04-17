@@ -50,9 +50,22 @@ def get_omni3d_categories(dataset="omni3d"):
         cats = set({'tram'})
         assert len(cats) == 1
     elif dataset in ["WildBox_train", "WildBox_val", "WildBox_test"]:
-        # Per-species rollout starts with rhino + elephant; extend as more
-        # species are added to the data-prep pipeline.
-        cats = set({'rhino', 'elephant'})
+        # Read categories directly from the generated split JSON so that
+        # adding / removing species in prepare_wildbox_dataset.py doesn't
+        # require editing this file. Falls back to a safe superset if the
+        # JSON hasn't been produced yet.
+        import os, json
+        path = os.path.join("datasets", "Omni3D", f"{dataset}.json")
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                d = json.load(f)
+            cats = {c["name"] for c in d.get("categories", [])}
+            if not cats:
+                # Empty categories list: fall through to the safe superset
+                # so eval still runs instead of crashing.
+                cats = {'rhino', 'elephant', 'zebra', 'giraffe', 'lion', 'gazelle'}
+        else:
+            cats = {'rhino', 'elephant', 'zebra', 'giraffe', 'lion', 'gazelle'}
     else:
         raise ValueError("%s dataset is not registered." % (dataset))
 

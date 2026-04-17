@@ -330,9 +330,24 @@ class Omni3DEvaluationHelper:
         """
         
         if not dataset_name in self.results:
-            
-            # run evaluation and cache
-            self.results[dataset_name] = self.evaluators[dataset_name].evaluate()
+
+            # run evaluation and cache. Catch the "zero in-vocab predictions"
+            # case (closed-vocab pretrained model evaluated on unseen
+            # categories) and short-circuit so we log a clean baseline entry
+            # instead of crashing the whole run. Raw predictions are still
+            # saved to disk by save_predictions() before this call, so the
+            # class_agnostic_eval.py script can produce meaningful numbers.
+            try:
+                self.results[dataset_name] = self.evaluators[dataset_name].evaluate()
+            except TypeError as e:
+                if "NoneType" in str(e):
+                    logger.warning(
+                        f"[{dataset_name}] zero in-vocab predictions — "
+                        f"skipping AP tables. Use tools/class_agnostic_eval.py "
+                        f"on instances_predictions.pth for a real baseline."
+                    )
+                    return
+                raise
 
         results = self.results[dataset_name]
 

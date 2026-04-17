@@ -20,6 +20,42 @@ import numpy as np
 import torch
 
 
+def cuboid_corners_from_center_dims_R(
+    center: np.ndarray, dims_whl: np.ndarray, R: np.ndarray
+) -> np.ndarray:
+    """(3,) center + (3,) [W, H, L] + (3,3) R -> (8, 3) corner points.
+
+    Uses Omni3D's axis convention: X-extent=L, Y-extent=H, Z-extent=W
+    (see cubercnn/util/math_util.py:172-181).
+    """
+    W, H, L = float(dims_whl[0]), float(dims_whl[1]), float(dims_whl[2])
+    corners_local = np.array([
+        [-L/2, -H/2, -W/2], [+L/2, -H/2, -W/2],
+        [+L/2, +H/2, -W/2], [-L/2, +H/2, -W/2],
+        [-L/2, -H/2, +W/2], [+L/2, -H/2, +W/2],
+        [+L/2, +H/2, +W/2], [-L/2, +H/2, +W/2],
+    ], dtype=np.float64)
+    return (R @ corners_local.T).T + center
+
+
+def normalized_hausdorff(corners_a: np.ndarray, corners_b: np.ndarray) -> float:
+    """Symmetric Hausdorff distance between two (8, 3) corner sets,
+    normalized by the mean diagonal of the two cuboids.
+
+    This is a pytorch3d-free surrogate for 3D IoU that captures all three
+    sources of error (center, dimensions, pose) in one number. Lower is
+    better. 0.0 = perfect overlap; 1.0 means corners are typically one box
+    diagonal apart.
+    """
+    # pairwise distances
+    d = np.linalg.norm(corners_a[:, None, :] - corners_b[None, :, :], axis=2)
+    h = max(d.min(axis=1).max(), d.min(axis=0).max())
+    # normalize by mean box diagonal
+    diag_a = np.linalg.norm(corners_a.max(axis=0) - corners_a.min(axis=0))
+    diag_b = np.linalg.norm(corners_b.max(axis=0) - corners_b.min(axis=0))
+    return float(h / (0.5 * (diag_a + diag_b) + 1e-8))
+
+
 def iou_2d(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
     """Vectorized IoU for boxes in XYXY. (N, 4) x (M, 4) -> (N, M)."""
     ax1, ay1, ax2, ay2 = boxes_a[:, 0:1], boxes_a[:, 1:2], boxes_a[:, 2:3], boxes_a[:, 3:4]
@@ -105,6 +141,13 @@ def main():
                    default=[0.25, 0.5, 0.75])
     p.add_argument("--score-min", type=float, default=0.0,
                    help="Drop predictions below this score before evaluating")
+    p.add_argument("--nhd", action="store_true",
+                   help="Also compute class-agnostic 3D NHD (pytorch3d-free "
+                        "surrogate for 3D IoU — lower is better; scale-invariant "
+                        "via automatic global-scale search). Useful for synthetic-"
+                        "scale VGGT data.")
+    p.add_argument("--nhd-scales", type=str, default="0.1,5.0,50",
+                   help="Scale search for NHD: 'min,max,n_log_steps'")
     args = p.parse_args()
 
     print(f"Loading predictions from {args.preds}...")
@@ -175,6 +218,142 @@ def main():
     for t in args.iou_thresholds:
         ap = compute_ap_at_iou(preds_per_img, gts_per_img, t)
         print(f"  AP@{t:.2f} = {100*ap:6.2f}")
+
+    # Per-class class-agnostic: split preds+gts by class index using the
+    # model's OWN contiguous ids. Useful after fine-tuning, where the model
+    # learned which slot = which species -- tells you which class the
+    # localizer struggles with.
+    classes_in_gt = {ann["category_id"] for ann in gt["annotations"]}
+    cat_id_to_name = {c["id"]: c["name"] for c in gt["categories"]}
+    # Build dataset-id -> contiguous-id mapping from GT categories (sorted by id).
+    sorted_ids = sorted(c["id"] for c in gt["categories"])
+    dataset_to_contiguous = {cid: i for i, cid in enumerate(sorted_ids)}
+    contiguous_to_name = {i: cat_id_to_name[cid] for cid, i in dataset_to_contiguous.items()}
+
+    # Group GT by (image, contiguous_class)
+    per_class_gt = {c: {} for c in contiguous_to_name}
+    for ann in gt["annotations"]:
+        ctg = dataset_to_contiguous[ann["category_id"]]
+        x, y, w, h = ann["bbox"]
+        per_class_gt[ctg].setdefault(ann["image_id"], []).append([x, y, x + w, y + h])
+
+    # Group predictions by contiguous_class
+    per_class_preds: dict[int, dict] = {c: {} for c in contiguous_to_name}
+    for im in preds:
+        img_id = im["image_id"]
+        for inst in im.get("instances", []):
+            c = int(inst["category_id"])
+            if c not in per_class_preds:
+                continue  # OOV contiguous class from 50-head
+            box = list(inst["bbox"])
+            box[2] += box[0]
+            box[3] += box[1]
+            per_class_preds[c].setdefault(img_id, []).append((float(inst["score"]), box))
+
+    if args.nhd:
+        print(f"\n=== class-agnostic 3D NHD (pytorch3d-free Rel-AP3D surrogate) ===")
+        # Collect (center_cam, dims, R) for every GT ann and every prediction.
+        # Match by 2D IoU (>= 0.5) within each image, then compute NHD for
+        # matched pairs. Finally, search a single global scale factor that
+        # minimizes mean NHD across all matched pairs -- that's the
+        # synthetic-scale correction, analogous to Rel-AP3D.
+        gt_3d_by_img: dict[int, list] = {}
+        for ann in gt["annotations"]:
+            if not ann.get("valid3D", True) or ann.get("behind_camera", False):
+                continue
+            c = np.array(ann["center_cam"], dtype=np.float64)
+            # Omni3D stores dimensions as [W, H, L]
+            d = np.array(ann["dimensions"], dtype=np.float64)
+            R = np.array(ann["R_cam"], dtype=np.float64)
+            x, y, w, h = ann["bbox"]
+            gt_3d_by_img.setdefault(ann["image_id"], []).append({
+                "corners": cuboid_corners_from_center_dims_R(c, d, R),
+                "box2d": np.array([x, y, x+w, y+h]),
+            })
+
+        pred_3d_by_img: dict[int, list] = {}
+        for im in preds:
+            img_id = im["image_id"]
+            for inst in im.get("instances", []):
+                score = float(inst["score"])
+                if score < args.score_min:
+                    continue
+                if "bbox3D_cam" in inst and inst["bbox3D_cam"] is not None:
+                    corners = np.array(inst["bbox3D_cam"], dtype=np.float64)
+                    if corners.shape != (8, 3):
+                        continue
+                else:
+                    continue
+                x, y, w, h = inst["bbox"]
+                pred_3d_by_img.setdefault(img_id, []).append({
+                    "corners": corners,
+                    "box2d": np.array([x, y, x+w, y+h]),
+                    "score": score,
+                })
+
+        # Match predictions to GT boxes via 2D IoU and collect pairs.
+        pairs = []  # (pred_corners, gt_corners)
+        for img_id, gts in gt_3d_by_img.items():
+            preds_here = pred_3d_by_img.get(img_id, [])
+            if not preds_here:
+                continue
+            gt_boxes = np.array([g["box2d"] for g in gts])
+            pd_boxes = np.array([p["box2d"] for p in preds_here])
+            iou = iou_2d(pd_boxes, gt_boxes)  # (P, G)
+            # greedy match by highest score * best IoU
+            order = np.argsort(-np.array([p["score"] for p in preds_here]))
+            gt_used = np.zeros(len(gts), dtype=bool)
+            for pi in order:
+                if not len(gts):
+                    break
+                j = int(np.argmax(iou[pi]))
+                if iou[pi, j] >= 0.5 and not gt_used[j]:
+                    pairs.append((preds_here[pi]["corners"], gts[j]["corners"]))
+                    gt_used[j] = True
+        if not pairs:
+            print("  no 2D-matched 3D pairs -- cannot compute NHD")
+        else:
+            # At scale s, scale pred corners uniformly about origin.
+            lo, hi, n = args.nhd_scales.split(",")
+            scales = np.logspace(np.log10(float(lo)), np.log10(float(hi)), int(n))
+            best_s, best_mean = 1.0, float("inf")
+            for s in scales:
+                nhds = [normalized_hausdorff(s * p, g) for p, g in pairs]
+                m = float(np.mean(nhds))
+                if m < best_mean:
+                    best_mean, best_s = m, s
+            print(f"  matched pairs:      {len(pairs)}")
+            print(f"  mean NHD @ s=1:     {np.mean([normalized_hausdorff(p, g) for p, g in pairs]):6.3f}")
+            print(f"  best global scale:  {best_s:6.3f}")
+            print(f"  mean NHD @ best s:  {best_mean:6.3f}   (lower = better; ~0.5 is decent, <0.3 is good)")
+            # Fraction of pairs below NHD thresholds (like AP@IoU but for NHD).
+            nhds = np.array([normalized_hausdorff(best_s * p, g) for p, g in pairs])
+            for thr in (0.3, 0.5, 1.0):
+                frac = (nhds < thr).mean() * 100
+                print(f"  frac pairs NHD<{thr}: {frac:6.2f}%")
+
+    print(f"\n=== per-class AP (model's own class assignments) ===")
+    for c, name in contiguous_to_name.items():
+        # Build aligned lists using GT images for this class
+        ids = sorted(per_class_gt[c].keys())
+        if not ids:
+            continue
+        ppi = []
+        gpi = []
+        for iid in ids:
+            entries = per_class_preds[c].get(iid, [])
+            if entries:
+                s = np.array([e[0] for e in entries])
+                b = np.array([e[1] for e in entries])
+            else:
+                s = np.array([])
+                b = np.zeros((0, 4))
+            ppi.append((s, b))
+            gpi.append(np.array(per_class_gt[c][iid]))
+        for t in args.iou_thresholds:
+            ap = compute_ap_at_iou(ppi, gpi, t)
+            print(f"  {name:12s} AP@{t:.2f} = {100*ap:6.2f}  "
+                  f"(gt_images={len(ids)}, preds_seen={sum(len(v) for v in per_class_preds[c].values())})")
 
 
 if __name__ == "__main__":

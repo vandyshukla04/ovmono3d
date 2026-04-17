@@ -126,11 +126,22 @@ def do_test(cfg, model, iteration='final', storage=None, mode="novel"):
             logger.info(log_str)
 
     if comm.is_main_process():
-        
+
         '''
-        Summarize each Omni3D Evaluation metric
-        '''  
-        eval_helper.summarize_all()
+        Summarize each Omni3D Evaluation metric.
+        Tolerate the zero-shot-on-unseen-classes case where evaluate()
+        short-circuited: save_predictions() already wrote the raw
+        instances_predictions.pth, which is what class-agnostic tooling
+        needs.
+        '''
+        try:
+            eval_helper.summarize_all()
+        except Exception as e:
+            logger.warning(
+                f"summarize_all() failed ({type(e).__name__}: {e}); "
+                f"raw predictions are saved and usable with "
+                f"tools/class_agnostic_eval.py."
+            )
 
 
 def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, resume=False):

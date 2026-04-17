@@ -20,6 +20,13 @@ pip install "numpy<2"
 # in the active env.
 pip install ninja setuptools wheel
 
+# FORCE_CUDA=1 is REQUIRED on CPU-only build nodes. Without it, pytorch3d
+# checks torch.cuda.is_available() at build time (False on a CPU node) and
+# silently drops the CUDA kernels — box3d_overlap then fails at runtime with
+# "Not compiled with GPU support" and Rel-AP3D breaks. TORCH_CUDA_ARCH_LIST
+# limits compilation to the actual target GPU (A40 = 8.6) to cut build time.
+export FORCE_CUDA=1
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.6}"
 pip install --no-build-isolation git+https://github.com/facebookresearch/pytorch3d.git@055ab3a
 pip install --no-build-isolation git+https://github.com/yaojin17/detectron2.git  # slightly modified detectron2 for OVMono3D
 pip install cython opencv-python scipy pandas einops open_clip_torch open3d
