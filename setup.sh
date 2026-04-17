@@ -26,11 +26,18 @@ pip install cython opencv-python scipy pandas einops open_clip_torch open3d
 
 pip install --no-build-isolation git+https://github.com/apple/ml-depth-pro.git@b2cd0d5
 pip install --no-build-isolation git+https://github.com/facebookresearch/segment-anything.git@dca509f
-pip install --no-build-isolation git+https://github.com/IDEA-Research/GroundingDINO.git@856dde2
+# GroundingDINO is optional — only used by the geometric-baseline tool
+# (tools/ovmono3d_geo.py) and the open-vocab 2D detector path. Training/eval
+# with TEST.ORACLE2D=True (the WildBox config default) does not need it.
+# If you do want it, uncomment the next line and make sure CUDA/gcc are new
+# enough to build its CUDA kernels.
+# pip install --no-build-isolation git+https://github.com/IDEA-Research/GroundingDINO.git@856dde2
 
 mkdir -p checkpoints
 # Skip re-downloading if the 4 checkpoints are already present.
-if [ ! -f ./checkpoints/groundingdino_swinb_cogcoor.pth ]; then
+# Only download the GroundingDINO checkpoint if the package is actually
+# installed — otherwise the file is unused and just wastes disk.
+if python -c "import groundingdino" 2>/dev/null && [ ! -f ./checkpoints/groundingdino_swinb_cogcoor.pth ]; then
     wget -P ./checkpoints/ https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
 fi
 if [ ! -f ./checkpoints/depth_pro.pt ]; then

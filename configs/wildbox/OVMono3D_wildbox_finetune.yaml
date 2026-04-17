@@ -36,6 +36,11 @@ TEST:
   REL_AP3D_SEARCH: (0.1, 5.0, 50)
   # Force the class-agnostic open-vocab code path at eval time.
   CAT_MODE: "novel"
+  # Base config sets ORACLE2D=True and expects precomputed per-dataset
+  # 2D proposals (gdino_*_oracle_2d.json). We don't have those for WildBox,
+  # so use the model's own RPN at test time. Same protocol for zero-shot
+  # and fine-tuned eval -> fair comparison.
+  ORACLE2D: False
 DATASETS:
   TRAIN: ('WildBox_train',)
   # DATASETS.TEST is unused by do_test; TEST_NOVEL/TEST_BASE are the ones
