@@ -272,17 +272,47 @@ def main():
             })
 
         pred_3d_by_img: dict[int, list] = {}
+        # Diagnostics: what keys are actually present on predictions?
+        sample_keys = None
+        skipped_reasons: dict[str, int] = {}
+        kept = 0
         for im in preds:
             img_id = im["image_id"]
             for inst in im.get("instances", []):
+                if sample_keys is None:
+                    sample_keys = sorted(inst.keys())
                 score = float(inst["score"])
                 if score < args.score_min:
                     continue
+                # OVMono3D saves predictions as center_cam + dimensions + pose
+                # (not as pre-built 8-corner array). Build corners from those.
+                corners = None
                 if "bbox3D_cam" in inst and inst["bbox3D_cam"] is not None:
-                    corners = np.array(inst["bbox3D_cam"], dtype=np.float64)
-                    if corners.shape != (8, 3):
-                        continue
-                else:
+                    try:
+                        c = np.array(inst["bbox3D_cam"], dtype=np.float64)
+                        if c.shape == (8, 3):
+                            corners = c
+                    except Exception:
+                        pass
+                if corners is None and all(k in inst for k in ("center_cam", "dimensions", "pose")):
+                    try:
+                        center = np.array(inst["center_cam"], dtype=np.float64).reshape(-1)
+                        dims = np.array(inst["dimensions"], dtype=np.float64).reshape(-1)
+                        pose = np.array(inst["pose"], dtype=np.float64)
+                        # pose may be (3,3) or flattened (9,)
+                        if pose.size == 9:
+                            pose = pose.reshape(3, 3)
+                        if center.size == 3 and dims.size == 3 and pose.shape == (3, 3):
+                            corners = cuboid_corners_from_center_dims_R(
+                                center, dims, pose)
+                    except Exception as e:
+                        skipped_reasons[f"build_err:{type(e).__name__}"] = \
+                            skipped_reasons.get(f"build_err:{type(e).__name__}", 0) + 1
+                if corners is None:
+                    missing = [k for k in ("bbox3D_cam", "center_cam",
+                                           "dimensions", "pose") if k not in inst]
+                    key = "missing:" + ",".join(missing) if missing else "bad_shape"
+                    skipped_reasons[key] = skipped_reasons.get(key, 0) + 1
                     continue
                 x, y, w, h = inst["bbox"]
                 pred_3d_by_img.setdefault(img_id, []).append({
@@ -290,6 +320,13 @@ def main():
                     "box2d": np.array([x, y, x+w, y+h]),
                     "score": score,
                 })
+                kept += 1
+        if sample_keys is not None:
+            print(f"  prediction keys seen: {sample_keys}")
+        print(f"  3D-valid preds kept:  {kept}")
+        if skipped_reasons:
+            print(f"  skipped (first 5 reasons): "
+                  f"{sorted(skipped_reasons.items(), key=lambda x: -x[1])[:5]}")
 
         # Match predictions to GT boxes via 2D IoU and collect pairs.
         pairs = []  # (pred_corners, gt_corners)
