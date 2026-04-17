@@ -1027,39 +1027,19 @@ class Omni3DEvaluator(COCOEvaluator):
         )
         for task in sorted(tasks):
             assert task in {"bbox"}, f"Got unknown task: {task}!"
-            if len(omni_results) == 0:
-                # Zero in-vocab predictions (e.g. closed-vocab pretrained model
-                # evaluated on unseen categories) — cocoapi can't cope, so write
-                # zeroed metrics and skip. Gives a valid "zero-shot baseline"
-                # entry rather than crashing the run.
-                self._logger.warning(
-                    f"No in-vocab predictions for task '{task}'; "
-                    f"skipping COCO eval and recording zero metrics."
+            evals, log_strs = (
+                _evaluate_predictions_on_omni(
+                    self._omni_api,
+                    omni_results,
+                    task,
+                    img_ids=img_ids,
+                    only_2d=self._only_2d,
+                    eval_prox=self._eval_prox,
+                    eval_rel_ap3d=self._eval_rel_ap3d,
+                    rel_ap3d_search=self._rel_ap3d_search,
                 )
-                empty = {"AP": 0.0, "AP50": 0.0, "AP75": 0.0}
-                self._results[task + "_2D"] = empty
-                if not self._only_2d:
-                    self._results[task + "_3D"] = empty
-                    if self._eval_rel_ap3d:
-                        self._results[task + "_3D-Rel"] = empty
-                self._results["log_str_2D"] = (
-                    f"task={task}: zero in-vocab predictions, metrics are 0.\n"
-                )
-                if not self._only_2d:
-                    self._results["log_str_3D"] = self._results["log_str_2D"]
-                    if self._eval_rel_ap3d:
-                        self._results["log_str_3D-Rel"] = self._results["log_str_2D"]
-                continue
-
-            evals, log_strs = _evaluate_predictions_on_omni(
-                self._omni_api,
-                omni_results,
-                task,
-                img_ids=img_ids,
-                only_2d=self._only_2d,
-                eval_prox=self._eval_prox,
-                eval_rel_ap3d=self._eval_rel_ap3d,
-                rel_ap3d_search=self._rel_ap3d_search,
+                if len(omni_results) > 0
+                else None  # cocoapi does not handle empty results very well
             )
 
             modes = evals.keys()
