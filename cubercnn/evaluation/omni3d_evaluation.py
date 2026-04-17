@@ -1383,8 +1383,12 @@ class Omni3Deval(COCOeval):
             self.rel_scale = 1.0
             return 1.0
 
-        device = (torch.device("cuda:0") if torch.cuda.is_available()
-                  else torch.device("cpu"))
+        # Force CPU: pytorch3d._C.iou_box3d has a CPU kernel in commit 055ab3a,
+        # but its CUDA kernel only exists if pytorch3d was built with FORCE_CUDA.
+        # On clusters where glibc blocks that build, we fall back to CPU here
+        # — same result, just slower. The regular AP3D path also runs on CPU
+        # tensors, so using CPU here makes the two code paths consistent.
+        device = torch.device("cpu")
         dd_all = torch.tensor(dt_list, device=device, dtype=torch.float32)
         gg_all = torch.tensor(gt_list, device=device, dtype=torch.float32)
 
