@@ -1043,8 +1043,7 @@ class Omni3DEvaluator(COCOEvaluator):
                     if self._eval_rel_ap3d:
                         self._results[task + "_3D-Rel"] = empty
                 self._results["log_str_2D"] = (
-                    f"{self._dataset_name} task={task}: "
-                    f"zero in-vocab predictions, metrics are 0.\n"
+                    f"task={task}: zero in-vocab predictions, metrics are 0.\n"
                 )
                 if not self._only_2d:
                     self._results["log_str_3D"] = self._results["log_str_2D"]
