@@ -118,12 +118,20 @@ def do_test(cfg, model, iteration='final', storage=None, mode="novel"):
             # else:
             #     category_names_official = MetadataCatalog.get('omni3d_model').thing_classes
             instances = torch.load(os.path.join(output_folder, dataset_name, 'instances_predictions.pth'))
-            log_str = vis.visualize_from_instances(
-                instances, data_loader.dataset, dataset_name, 
-                cfg.INPUT.MIN_SIZE_TEST, os.path.join(output_folder, dataset_name), 
-                category_names_official, MetadataCatalog.get(dataset_name).thing_classes, iteration
-            )
-            logger.info(log_str)
+            # Visualization is decorative -- never let it kill training.
+            try:
+                log_str = vis.visualize_from_instances(
+                    instances, data_loader.dataset, dataset_name,
+                    cfg.INPUT.MIN_SIZE_TEST, os.path.join(output_folder, dataset_name),
+                    category_names_official, MetadataCatalog.get(dataset_name).thing_classes, iteration
+                )
+                logger.info(log_str)
+            except Exception as e:
+                logger.warning(
+                    f"visualize_from_instances() failed "
+                    f"({type(e).__name__}: {e}); continuing — "
+                    f"metrics/checkpoints are unaffected."
+                )
 
     if comm.is_main_process():
 

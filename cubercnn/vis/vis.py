@@ -167,7 +167,14 @@ def visualize_from_instances(detections, dataset, dataset_name, min_size_test, o
                 draw_text(im_gt_all_classes_3d, category_names_official[anno['category_id']], anno['bbox'], scale=0.50*im.shape[0]/500, bg_color=color)
         
         for instance in im_obj['instances']:
-            
+
+            # The model head has NUM_CLASSES=50 output slots but the eval
+            # dataset may have fewer categories registered (e.g. 3 WildBox
+            # species). Skip predictions whose contiguous class id is out of
+            # range for the current category_names_official list rather than
+            # crashing the vis step.
+            if instance['category_id'] >= len(category_names_official):
+                continue
             cat = category_names_official[instance['category_id']]
             score = instance['score']
             x1, y1, w, h = instance['bbox']
