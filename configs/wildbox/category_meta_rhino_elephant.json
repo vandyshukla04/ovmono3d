@@ -1,0 +1,3 @@
+{"_comment": "WildBox rhino+elephant category meta",
+ "thing_classes": ["rhino", "elephant"],
+ "thing_dataset_id_to_contiguous_id": {"1002": 1, "1004": 0}}

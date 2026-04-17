@@ -11,14 +11,25 @@ things that matter for drone top-down shots:
   - the full 3x3 rotation matrix collapsed to a scalar rot_y (pitch/roll
     are lost, which is most of the orientation for top-down cameras)
 
-Input per segment (produced by the user's VGGT+SAM3 pipeline):
-  <root>/<species>/WildBox_sam3-vggtv1_processed/WildBox/<video>/<seg>/
+Input: one or more --source entries. Each source points directly to the
+directory that contains <video>/<segment>/vggt_results/. For example:
+
+  --source /storage3/.../dataRhinoCami2025/WildBoxVGGT-v1/WildBox=rhino:1004
+  --source /storage3/.../data202406KElephants/WildBox_vggtv1/WildBox=elephant:1002
+
+Per segment (produced by the user's VGGT+SAM3 pipeline) we expect:
+  <source_path>/<video>/<seg>/
     frame_XXXXXX.jpg
     vggt_results/cameras.json           # per-frame intrinsic + extrinsic
     vggt_results/tracking_summary.json  # per-track 3D state (world coords)
 
 Output:
-  datasets/Omni3D/<name>.json           # Omni3D-style dict
+  datasets/Omni3D/<name>.json           # Omni3D-style dict (absolute file_paths)
+
+file_path is stored as the absolute path to the JPEG. Omni3D's loader does
+os.path.join(image_root, file_path); when file_path is absolute, Python's
+os.path.join returns it unchanged, so no symlink dance under datasets/ is
+required.
 
 Scale: VGGT output is in its own synthetic units. We apply a per-segment
 scalar so median |Z_cam| across all boxes in the segment maps to 1.0.
@@ -60,6 +71,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import struct
 import sys
 from dataclasses import dataclass
@@ -73,43 +85,38 @@ logger = logging.getLogger("prepare_wildbox_dataset")
 
 @dataclass
 class VggtBox:
-    """Full-precision 3D box read from VGGT tracking_summary.json.
-
-    Fields are in VGGT's WORLD coordinate frame until transformed by the
-    per-frame extrinsic. `dimensions_lwh` is (l, w, h) in VGGT's own
-    naming, which corresponds to (X-extent, Y-extent, Z-extent) of the
-    local object frame (see demo_viser_tracking.py:109-121).
-    """
+    """Full-precision 3D box read from VGGT tracking_summary.json."""
     track_id: int
-    frame_seq: int                                 # 0-indexed camera/frame position
+    frame_seq: int
     class_name: str
-    center_world: np.ndarray                       # (3,)
-    dimensions_lwh: np.ndarray                     # (3,) VGGT (l, w, h)
-    R_world: np.ndarray                            # (3, 3) object rotation in world
-    bbox_2d_vggt: Tuple[float, float, float, float]  # (l,t,r,b) at VGGT resolution
+    center_world: np.ndarray
+    dimensions_lwh: np.ndarray
+    R_world: np.ndarray
+    bbox_2d_vggt: Tuple[float, float, float, float]
     confidence: float
+
+
+@dataclass
+class Source:
+    """One data source on disk. `path` contains <video>/<seg>/ subdirs."""
+    path: Path
+    category_name: str
+    category_id: int
 
 
 def vggt_corners_world(center: np.ndarray, dims_lwh: np.ndarray,
                        R: np.ndarray) -> np.ndarray:
-    """Compute 8 world-frame corners using VGGT's exact formula
-    (demo_viser_tracking.py:109-121). Returns (8, 3)."""
     l, w, h = float(dims_lwh[0]), float(dims_lwh[1]), float(dims_lwh[2])
     corners_local = np.array([
-        [-l/2, -w/2, -h/2],
-        [+l/2, -w/2, -h/2],
-        [+l/2, +w/2, -h/2],
-        [-l/2, +w/2, -h/2],
-        [-l/2, -w/2, +h/2],
-        [+l/2, -w/2, +h/2],
-        [+l/2, +w/2, +h/2],
-        [-l/2, +w/2, +h/2],
+        [-l/2, -w/2, -h/2], [+l/2, -w/2, -h/2],
+        [+l/2, +w/2, -h/2], [-l/2, +w/2, -h/2],
+        [-l/2, -w/2, +h/2], [+l/2, -w/2, +h/2],
+        [+l/2, +w/2, +h/2], [-l/2, +w/2, +h/2],
     ], dtype=np.float64)
     return (R @ corners_local.T).T + center
 
 
 def project_points(corners_cam: np.ndarray, K: np.ndarray) -> np.ndarray:
-    """Project (N, 3) camera-space points to (N, 2) image pixels."""
     xs = corners_cam[:, 0] / corners_cam[:, 2]
     ys = corners_cam[:, 1] / corners_cam[:, 2]
     u = K[0, 0] * xs + K[0, 2]
@@ -117,39 +124,34 @@ def project_points(corners_cam: np.ndarray, K: np.ndarray) -> np.ndarray:
     return np.stack([u, v], axis=1)
 
 
-def project_points(corners_cam: np.ndarray, K: np.ndarray) -> np.ndarray:
-    """Project (N, 3) camera-space points to (N, 2) image pixels."""
-    xs = corners_cam[:, 0] / corners_cam[:, 2]
-    ys = corners_cam[:, 1] / corners_cam[:, 2]
-    u = K[0, 0] * xs + K[0, 2]
-    v = K[1, 1] * ys + K[1, 2]
-    return np.stack([u, v], axis=1)
-
-
-def discover_segments(root: Path, species: List[str]) -> List[Dict]:
-    """Walk the WildBox tree and enumerate segments under each species."""
+def discover_segments(sources: List[Source]) -> List[Dict]:
+    """Walk each source path and enumerate its <video>/<seg> subdirs."""
     segments = []
-    for sp in species:
-        sp_root = root / sp / "WildBox_sam3-vggtv1_processed" / "WildBox"
-        if not sp_root.exists():
-            logger.warning(f"Species root not found: {sp_root}")
+    for src in sources:
+        if not src.path.exists():
+            logger.warning(f"Source path not found: {src.path}")
             continue
-        for video_dir in sorted(sp_root.iterdir()):
+        for video_dir in sorted(src.path.iterdir()):
             if not video_dir.is_dir():
                 continue
             for seg_dir in sorted(video_dir.iterdir()):
-                if not seg_dir.is_dir() or not seg_dir.name.startswith("seg"):
+                if not seg_dir.is_dir():
                     continue
                 cameras_json = seg_dir / "vggt_results" / "cameras.json"
                 tracking_json = seg_dir / "vggt_results" / "tracking_summary.json"
                 if not cameras_json.exists() or not tracking_json.exists():
-                    logger.warning(f"Skipping incomplete segment: {seg_dir}")
+                    logger.debug(f"Skipping incomplete segment: {seg_dir}")
                     continue
+                # Unique id across sources: prefix with category to dodge
+                # name clashes (both sources can have the same video/seg
+                # name by coincidence).
+                seg_id = f"{src.category_name}/{video_dir.name}/{seg_dir.name}"
                 segments.append({
-                    "species": sp,
+                    "seg_id": seg_id,
+                    "category_name": src.category_name,
+                    "category_id": src.category_id,
                     "video": video_dir.name,
                     "seg": seg_dir.name,
-                    "seg_id": f"{video_dir.name}/{seg_dir.name}",
                     "seg_dir": seg_dir,
                     "cameras_json": cameras_json,
                     "tracking_json": tracking_json,
@@ -158,7 +160,6 @@ def discover_segments(root: Path, species: List[str]) -> List[Dict]:
 
 
 def read_jpeg_dimensions(path: Path) -> Tuple[int, int]:
-    """Parse JPEG SOF marker to read (height, width) without decoding."""
     with open(path, "rb") as f:
         data = f.read(2)
         if data != b"\xff\xd8":
@@ -170,10 +171,9 @@ def read_jpeg_dimensions(path: Path) -> Tuple[int, int]:
             if marker[0] != 0xFF:
                 raise ValueError(f"{path}: bad marker byte {marker[0]:#x}")
             m = marker[1]
-            # SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15 are all SOFn
             if m in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                      0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
-                length = struct.unpack(">H", f.read(2))[0]
+                _length = struct.unpack(">H", f.read(2))[0]
                 _precision = f.read(1)
                 h, w = struct.unpack(">HH", f.read(4))
                 return h, w
@@ -182,21 +182,11 @@ def read_jpeg_dimensions(path: Path) -> Tuple[int, int]:
 
 
 def load_segment(seg: Dict) -> Optional[Dict]:
-    """Read tracking_summary.json and cameras.json for one segment.
-
-    Returns a dict with:
-      frames_seq:     list of per-frame dicts (K_real, extrinsic, image name, dims)
-      boxes_by_frame: {frame_seq: [VggtBox, ...]}
-      real_h/real_w:  actual JPEG dimensions
-      sx/sy:          VGGT->real resolution scale factors
-    """
     with open(seg["cameras_json"], "r") as f:
         cam_data = json.load(f)
     with open(seg["tracking_json"], "r") as f:
         track_data = json.load(f)
 
-    # Detect real JPEG dimensions (VGGT's cameras.json size is the downsized
-    # processing resolution; actual images on disk are usually larger).
     real_h, real_w = None, None
     for cam in cam_data["cameras"]:
         candidate = seg["seg_dir"] / cam["image_name"]
@@ -216,7 +206,6 @@ def load_segment(seg: Dict) -> Optional[Dict]:
     sx = real_w / vggt_w
     sy = real_h / vggt_h
 
-    # Per-frame camera state, keyed by frame_index (0-based sequence position).
     frames_seq: Dict[int, Dict] = {}
     for cam in cam_data["cameras"]:
         K_vggt = np.array(cam["intrinsic"], dtype=np.float64)
@@ -226,7 +215,7 @@ def load_segment(seg: Dict) -> Optional[Dict]:
         K_real[0, 2] *= sx
         K_real[1, 2] *= sy
 
-        ext = np.array(cam["extrinsic"], dtype=np.float64)  # (3, 4)
+        ext = np.array(cam["extrinsic"], dtype=np.float64)
 
         frames_seq[int(cam["frame_index"])] = {
             "image_name": cam["image_name"],
@@ -236,7 +225,6 @@ def load_segment(seg: Dict) -> Optional[Dict]:
             "image_width": real_w,
         }
 
-    # Collect per-frame VggtBox objects from the tracking summary.
     boxes_by_frame: Dict[int, List[VggtBox]] = {}
     for tid_str, track in track_data["tracks"].items():
         tid = int(tid_str)
@@ -273,7 +261,6 @@ def load_segment(seg: Dict) -> Optional[Dict]:
 
 def compute_scene_scale_cam(boxes_by_frame: Dict[int, List[VggtBox]],
                             frames_seq: Dict[int, Dict]) -> float:
-    """Map median camera-frame |Z| to 1.0 across the segment."""
     zs = []
     for fseq, boxes in boxes_by_frame.items():
         frame = frames_seq.get(fseq)
@@ -305,11 +292,6 @@ def build_annotation(
     category_id: int,
     category_name: str,
 ) -> Optional[Dict]:
-    """Convert one VggtBox + per-frame extrinsic into an Omni3D annotation.
-
-    No rotation rebuilding, no axis swapping — we use VGGT's own world-frame
-    corner formula and then apply the extrinsic to get camera-frame corners.
-    """
     ext = frame["extrinsic"]
     R_ext = ext[:3, :3]
     t_ext = ext[:3, 3]
@@ -320,30 +302,23 @@ def build_annotation(
 
     R_cam = R_ext @ box.R_world
 
-    # VGGT (l, w, h) maps axis-by-axis to Omni3D (L, H, W). Omni3D stores
-    # dimensions in order [W, H, L], which is the reverse of VGGT's tuple.
     dims_omni3d = np.array([
-        box.dimensions_lwh[2],  # W = VGGT.h  (Z-extent)
-        box.dimensions_lwh[1],  # H = VGGT.w  (Y-extent)
-        box.dimensions_lwh[0],  # L = VGGT.l  (X-extent)
+        box.dimensions_lwh[2],
+        box.dimensions_lwh[1],
+        box.dimensions_lwh[0],
     ], dtype=np.float64)
     if np.any(dims_omni3d <= 0):
         return None
 
-    # Full-precision camera-frame corners, via VGGT's own formula.
     corners_world = vggt_corners_world(box.center_world, box.dimensions_lwh, box.R_world)
-    corners_cam = (R_ext @ corners_world.T).T + t_ext  # (8, 3)
+    corners_cam = (R_ext @ corners_world.T).T + t_ext
 
-    # Per-scene uniform scaling: center, corners, dims all scale together.
     center_cam = center_cam * s_scene
     corners_cam = corners_cam * s_scene
     dims_omni3d = dims_omni3d * s_scene
 
-    # 2D bbox: VGGT pipeline stored it at small processing resolution; rescale
-    # to the actual image size.
     bl, bt, br, bb = box.bbox_2d_vggt
     if bl < 0 or bt < 0 or br < 0 or bb < 0:
-        # sentinel for invalid projection; re-derive from scaled corners
         corners_2d = project_points(corners_cam, frame["K_real"])
         bl = float(corners_2d[:, 0].min())
         bt = float(corners_2d[:, 1].min())
@@ -367,8 +342,6 @@ def build_annotation(
     bbox2d_xyxy = [bl_c, bt_c, br_c, bb_c]
     bbox_xywh = [bl_c, bt_c, br_c - bl_c, bb_c - bt_c]
 
-    # Also compute the tight projection of the 3D corners (useful when the
-    # stored SAM3 2D bbox is larger than the projected cuboid).
     corners_2d = project_points(corners_cam, frame["K_real"])
     u_min = float(np.clip(corners_2d[:, 0].min(), 0, img_w - 1))
     v_min = float(np.clip(corners_2d[:, 1].min(), 0, img_h - 1))
@@ -405,31 +378,22 @@ def build_annotation(
 
 def build_split_json(
     segments: List[Dict],
-    species_map: Dict[str, Tuple[str, int]],
     dataset_id: int,
     dataset_name: str,
-    image_root_prefix: str,
 ) -> Tuple[Dict, Dict[str, float]]:
-    """Build one Omni3D-style dict from a list of segments.
-
-    species_map maps the folder name under --root (e.g. 'rhinos') to a
-    (category_name, category_id) tuple. Segments whose species isn't in
-    the map are dropped with a warning.
-    """
+    """Build one Omni3D-style dict from a list of segment records."""
     images = []
     annotations = []
     scene_scales = {}
+    categories_seen: Dict[int, str] = {}
 
     next_image_id = 0
     next_ann_id = 0
 
     for seg in segments:
-        sp_key = seg["species"]
-        if sp_key not in species_map:
-            logger.warning(f"Skipping segment {seg['seg_id']} — species "
-                           f"'{sp_key}' not in --species-map")
-            continue
-        category_name, category_id = species_map[sp_key]
+        category_name = seg["category_name"]
+        category_id = seg["category_id"]
+        categories_seen[category_id] = category_name
 
         loaded = load_segment(seg)
         if loaded is None:
@@ -442,7 +406,6 @@ def build_split_json(
         s_scene = compute_scene_scale_cam(boxes_by_frame, frames_seq)
         scene_scales[seg["seg_id"]] = s_scene
 
-        # Iterate in frame_seq order for reproducibility.
         for fseq in sorted(frames_seq.keys()):
             frame = frames_seq[fseq]
             boxes = boxes_by_frame.get(fseq, [])
@@ -452,20 +415,12 @@ def build_split_json(
             image_id = next_image_id
             next_image_id += 1
 
-            rel_path = os.path.join(
-                image_root_prefix,
-                seg["species"],
-                "WildBox_sam3-vggtv1_processed",
-                "WildBox",
-                seg["video"],
-                seg["seg"],
-                frame["image_name"],
-            )
+            abs_frame_path = str((seg["seg_dir"] / frame["image_name"]).resolve())
 
             images.append({
                 "id": image_id,
                 "dataset_id": dataset_id,
-                "file_path": rel_path,
+                "file_path": abs_frame_path,
                 "height": frame["image_height"],
                 "width": frame["image_width"],
                 "K": frame["K_real"].tolist(),
@@ -490,7 +445,6 @@ def build_split_json(
                 annotations.append(ann)
                 next_ann_id += 1
 
-    category_ids_used = sorted({cid for _, cid in species_map.values()})
     data = {
         "info": {
             "id": dataset_id,
@@ -499,12 +453,12 @@ def build_split_json(
             "split": dataset_name.split("_")[-1],
             "version": "1.0",
             "url": "",
-            "known_category_ids": category_ids_used,
+            "known_category_ids": sorted(categories_seen.keys()),
             "scene_scales": scene_scales,
         },
         "categories": [
-            {"id": cid, "name": name, "supercategory": "animal"}
-            for name, cid in sorted(species_map.values(), key=lambda x: x[1])
+            {"id": cid, "name": categories_seen[cid], "supercategory": "animal"}
+            for cid in sorted(categories_seen.keys())
         ],
         "images": images,
         "annotations": annotations,
@@ -512,50 +466,96 @@ def build_split_json(
     return data, scene_scales
 
 
+def auto_split(segments: List[Dict], mode: str, val_fraction: float,
+               seed: int) -> Tuple[List[Dict], List[Dict]]:
+    """Split segments into train/val deterministically.
+
+    - mode="segment": each segment independently assigned to train or val.
+    - mode="video":   all segments of a given (category, video) go the same
+                      way. Stricter; prevents frames from adjacent segments
+                      of the same scene leaking between splits.
+
+    Grouping is per category so every category appears in both splits even
+    at small val fractions.
+    """
+    rng = random.Random(seed)
+
+    if mode == "segment":
+        group_key = lambda s: s["seg_id"]
+    elif mode == "video":
+        group_key = lambda s: f"{s['category_name']}/{s['video']}"
+    else:
+        raise ValueError(f"unknown split mode: {mode}")
+
+    # Partition segments by category so we stratify on category.
+    by_cat: Dict[str, List[Dict]] = {}
+    for seg in segments:
+        by_cat.setdefault(seg["category_name"], []).append(seg)
+
+    train: List[Dict] = []
+    val: List[Dict] = []
+    for cat, segs in by_cat.items():
+        # unique groups, sorted for determinism
+        groups = sorted({group_key(s) for s in segs})
+        rng.shuffle(groups)
+        n_val = max(1, int(round(len(groups) * val_fraction))) if groups else 0
+        if n_val >= len(groups):
+            n_val = max(1, len(groups) - 1)  # always keep at least one train group
+        val_groups = set(groups[:n_val])
+        for s in segs:
+            (val if group_key(s) in val_groups else train).append(s)
+        logger.info(f"[split] {cat}: {len(groups)} groups -> "
+                    f"{len(groups) - n_val} train / {n_val} val")
+
+    return train, val
+
+
+def parse_source(entry: str) -> Source:
+    """Parse 'path=category:category_id' into a Source."""
+    if "=" not in entry or ":" not in entry:
+        raise SystemExit(f"--source entry '{entry}' must be "
+                         f"'path=category:category_id'")
+    path_str, _, spec = entry.partition("=")
+    name, _, cid_str = spec.partition(":")
+    try:
+        cid = int(cid_str)
+    except ValueError:
+        raise SystemExit(f"--source: '{cid_str}' in '{entry}' is not an integer")
+    return Source(path=Path(path_str).expanduser(),
+                  category_name=name, category_id=cid)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--root", type=Path, required=True,
-                   help="WildBox videos root, e.g. /mnt/d/3DBOX/Data/videos/202401_Kenya")
-    p.add_argument("--species-map", nargs="+", required=True,
-                   help="Per-species mapping 'folder=category:category_id'. "
-                        "Example: 'giraffes=giraffe:1000' 'rhinos=rhino:1004' "
-                        "'elephants=elephant:1002'. The folder is the dir under "
-                        "--root; category name + id must match stats.json after "
-                        "running tools/patch_stats_for_wildbox.py.")
+    p.add_argument("--source", action="append", required=True,
+                   dest="sources",
+                   help="Data source as 'path=category:category_id'. The path "
+                        "is a directory containing <video>/<seg>/vggt_results/. "
+                        "Repeatable. Example: "
+                        "--source /.../WildBox=rhino:1004 "
+                        "--source /.../WildBox=elephant:1002")
+    p.add_argument("--split-mode", choices=("segment", "video", "manual"),
+                   default="segment",
+                   help="segment: random 80/20 split of segments per category "
+                        "(default). video: random split by (category, video), "
+                        "stricter. manual: use --train-segments/--val-segments.")
+    p.add_argument("--val-fraction", type=float, default=0.2,
+                   help="Fraction of groups held out for val (random modes only)")
+    p.add_argument("--seed", type=int, default=0,
+                   help="RNG seed for reproducible splits")
     p.add_argument("--train-segments", nargs="+", default=[],
-                   help="Segment ids (video/seg) to place in the train split")
+                   help="(manual mode) Segment ids 'category/video/seg' for train")
     p.add_argument("--val-segments", nargs="+", default=[],
-                   help="Segment ids (video/seg) to place in the val split")
+                   help="(manual mode) Segment ids 'category/video/seg' for val")
     p.add_argument("--output-train", type=Path,
                    default=Path("datasets/Omni3D/WildBox_train.json"))
     p.add_argument("--output-val", type=Path,
                    default=Path("datasets/Omni3D/WildBox_val.json"))
     p.add_argument("--dataset-id", type=int, default=1000,
                    help="Omni3D dataset id for the info section")
-    p.add_argument("--image-root-prefix", default="WildBox",
-                   help="Prefix prepended to file_path; must match the "
-                        "symlink at datasets/<prefix> -> /mnt/d/.../videos")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
-
-
-def parse_species_map(entries: List[str]) -> Dict[str, Tuple[str, int]]:
-    """Parse ['giraffes=giraffe:1000', 'rhinos=rhino:1004'] into a dict."""
-    out: Dict[str, Tuple[str, int]] = {}
-    for entry in entries:
-        if "=" not in entry or ":" not in entry:
-            raise SystemExit(f"--species-map entry '{entry}' must be "
-                             f"'folder=category:category_id'")
-        folder, _, spec = entry.partition("=")
-        name, _, cid_str = spec.partition(":")
-        try:
-            cid = int(cid_str)
-        except ValueError:
-            raise SystemExit(f"--species-map: '{cid_str}' in '{entry}' "
-                             f"is not an integer")
-        out[folder] = (name, cid)
-    return out
 
 
 def main():
@@ -565,40 +565,42 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    species_map = parse_species_map(args.species_map)
-    species_folders = list(species_map.keys())
+    sources = [parse_source(e) for e in args.sources]
+    for s in sources:
+        logger.info(f"Source: {s.path} -> {s.category_name} (id={s.category_id})")
 
-    all_segments = discover_segments(args.root, species_folders)
-    logger.info(f"Discovered {len(all_segments)} segments under "
-                f"{args.root} species={species_folders}")
+    all_segments = discover_segments(sources)
+    logger.info(f"Discovered {len(all_segments)} segments total")
     if not all_segments:
         sys.exit(2)
 
-    seg_by_id = {s["seg_id"]: s for s in all_segments}
+    if args.split_mode == "manual":
+        seg_by_id = {s["seg_id"]: s for s in all_segments}
+        train_segs = [seg_by_id[sid] for sid in args.train_segments if sid in seg_by_id]
+        val_segs = [seg_by_id[sid] for sid in args.val_segments if sid in seg_by_id]
+        missing = set(args.train_segments + args.val_segments) - set(seg_by_id.keys())
+        if missing:
+            logger.warning(f"Segment ids not found on disk: {sorted(missing)}")
+    else:
+        train_segs, val_segs = auto_split(
+            all_segments, mode=args.split_mode,
+            val_fraction=args.val_fraction, seed=args.seed,
+        )
 
-    train_segs = [seg_by_id[sid] for sid in args.train_segments if sid in seg_by_id]
-    val_segs = [seg_by_id[sid] for sid in args.val_segments if sid in seg_by_id]
-
-    missing = set(args.train_segments + args.val_segments) - set(seg_by_id.keys())
-    if missing:
-        logger.warning(f"Segment ids not found on disk: {sorted(missing)}")
-
-    if not train_segs and not val_segs:
-        logger.info("No explicit split given, placing everything into train.")
-        train_segs = all_segments
+    logger.info(f"Split: {len(train_segs)} train segments, "
+                f"{len(val_segs)} val segments")
 
     for split_name, segs, out_path in [
         ("train", train_segs, args.output_train),
         ("val", val_segs, args.output_val),
     ]:
         if not segs:
+            logger.warning(f"[{split_name}] no segments; skipping output")
             continue
         data, scales = build_split_json(
             segments=segs,
-            species_map=species_map,
             dataset_id=args.dataset_id,
             dataset_name=f"WildBox_{split_name}",
-            image_root_prefix=args.image_root_prefix,
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:

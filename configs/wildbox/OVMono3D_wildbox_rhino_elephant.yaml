@@ -1,0 +1,6 @@
+_BASE_: "OVMono3D_wildbox_finetune.yaml"
+DATASETS:
+  CATEGORY_NAMES: ('rhino', 'elephant')
+  CATEGORY_NAMES_NOVEL: ('rhino', 'elephant')
+  CATEGORY_NAMES_BASE: ('rhino', 'elephant')
+OUTPUT_DIR: "output/ovmono3d_wildbox_rhino_elephant"
