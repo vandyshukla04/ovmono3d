@@ -49,6 +49,10 @@ def get_omni3d_categories(dataset="omni3d"):
     elif dataset in [ "KITTI_test_novel"]:
         cats = set({'tram'})
         assert len(cats) == 1
+    elif dataset in ["WildBox_train", "WildBox_val", "WildBox_test"]:
+        # Per-species rollout starts with rhino + elephant; extend as more
+        # species are added to the data-prep pipeline.
+        cats = set({'rhino', 'elephant'})
     else:
         raise ValueError("%s dataset is not registered." % (dataset))
 
