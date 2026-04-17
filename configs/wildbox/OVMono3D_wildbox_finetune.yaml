@@ -33,7 +33,9 @@ TEST:
   # Run the Relative Layout AP3D metric after each normal AP3D pass.
   # This is the number to compare before vs. after fine-tuning.
   EVAL_REL_AP3D: True
-  REL_AP3D_SEARCH: (0.1, 5.0, 50)
+  # 50 scale points was ~30 min per eval on CPU pytorch3d. 20 points
+  # gives essentially the same best-scale estimate for ~12-15 min.
+  REL_AP3D_SEARCH: (0.1, 5.0, 20)
   # Force the class-agnostic open-vocab code path at eval time.
   CAT_MODE: "novel"
   # Base config sets ORACLE2D=True and expects precomputed per-dataset
