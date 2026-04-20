@@ -233,6 +233,42 @@ def read_jpeg_dimensions(path: Path) -> Tuple[int, int]:
             f.seek(length - 2, 1)
 
 
+def _load_mask_bbox(mask_path: Path) -> Optional[Tuple[float, float, float, float, int]]:
+    """Load an 8-bit PNG mask and return (x1, y1, x2, y2, pixel_count).
+
+    Returns None if the mask file is missing, unreadable, or empty.
+    Pure-Python (no cv2/PIL dep beyond PIL which is already in the env via
+    torchvision). Uses zlib + manual IDAT decode only if PIL isn't
+    available, but we assume PIL is present.
+    """
+    try:
+        from PIL import Image
+        import numpy as _np
+        with Image.open(mask_path) as im:
+            a = _np.asarray(im.convert("L"), dtype=_np.uint8)
+    except Exception:
+        return None
+    ys, xs = (a > 0).nonzero()
+    if xs.size == 0:
+        return None
+    return (float(xs.min()), float(ys.min()),
+            float(xs.max()), float(ys.max()),
+            int(xs.size))
+
+
+def _find_sam3_masks_dir(seg_dir: Path) -> Optional[Path]:
+    """Locate the SAM3 per-object mask directory.
+
+    Expected layout produced by the WildBox SAM3 pipeline:
+        <seg>/sam3_masks/masks/obj_<id>/frame_NNNNNN.png
+    Returns the `sam3_masks/masks/` directory if present, else None.
+    """
+    candidate = seg_dir / "sam3_masks" / "masks"
+    if candidate.is_dir():
+        return candidate
+    return None
+
+
 def load_segment(seg: Dict) -> Optional[Dict]:
     with open(seg["cameras_json"], "r") as f:
         cam_data = json.load(f)
@@ -301,6 +337,34 @@ def load_segment(seg: Dict) -> Optional[Dict]:
             )
             boxes_by_frame.setdefault(int(fseq), []).append(box)
 
+    # SAM3 per-object masks give tight 2D boxes; the VGGT-stored bbox_2d
+    # is usually the projected 3D cuboid, which is always loose (cuboid
+    # extent > animal silhouette). When masks are available, compute tight
+    # bboxes once and stash them per (track_id, frame_name) for the
+    # annotation builder to prefer.
+    sam3_masks_dir = _find_sam3_masks_dir(seg["seg_dir"])
+    sam3_boxes: Dict[Tuple[int, str], Tuple[float, float, float, float, int]] = {}
+    if sam3_masks_dir is not None:
+        # Enumerate obj_<id> dirs; assume VGGT track_id == SAM3 obj_id,
+        # which is how the WildBox pipeline emits them.
+        for obj_dir in sorted(sam3_masks_dir.iterdir()):
+            if not obj_dir.is_dir() or not obj_dir.name.startswith("obj_"):
+                continue
+            try:
+                obj_id = int(obj_dir.name.split("_", 1)[1])
+            except ValueError:
+                continue
+            for png in obj_dir.glob("frame_*.png"):
+                bbox = _load_mask_bbox(png)
+                if bbox is None:
+                    continue
+                # Map PNG filename back to the JPEG it corresponds to
+                # (cameras.json stores "frame_NNNNNN.jpg").
+                jpeg_name = png.stem + ".jpg"
+                sam3_boxes[(obj_id, jpeg_name)] = bbox
+        logger.debug(f"[{seg['seg_id']}] loaded {len(sam3_boxes)} SAM3 mask "
+                     f"bboxes from {sam3_masks_dir}")
+
     return {
         "frames_seq": frames_seq,
         "boxes_by_frame": boxes_by_frame,
@@ -308,6 +372,7 @@ def load_segment(seg: Dict) -> Optional[Dict]:
         "real_w": real_w,
         "sx": sx,
         "sy": sy,
+        "sam3_boxes": sam3_boxes,
     }
 
 
@@ -343,6 +408,7 @@ def build_annotation(
     dataset_id: int,
     category_id: int,
     category_name: str,
+    sam3_bbox: Optional[Tuple[float, float, float, float, int]] = None,
 ) -> Optional[Dict]:
     ext = frame["extrinsic"]
     R_ext = ext[:3, :3]
@@ -369,18 +435,30 @@ def build_annotation(
     corners_cam = corners_cam * s_scene
     dims_omni3d = dims_omni3d * s_scene
 
-    bl, bt, br, bb = box.bbox_2d_vggt
-    if bl < 0 or bt < 0 or br < 0 or bb < 0:
-        corners_2d = project_points(corners_cam, frame["K_real"])
-        bl = float(corners_2d[:, 0].min())
-        bt = float(corners_2d[:, 1].min())
-        br = float(corners_2d[:, 0].max())
-        bb = float(corners_2d[:, 1].max())
+    # Priority for the tight 2D bbox (used for 'bbox' and 'bbox2D_tight'):
+    #   1. SAM3 mask -- tightest (silhouette-level). Uses real image coords
+    #      directly; no sx/sy scaling needed since masks are at real res.
+    #   2. VGGT's stored bbox_2d -- sometimes tight (from SAM), often the
+    #      projected 3D cuboid (loose). Scale from VGGT res to real res.
+    #   3. Projected 3D cuboid corners -- always loose, last-resort fallback.
+    used_sam3 = False
+    mask_pixels = 0
+    if sam3_bbox is not None:
+        bl, bt, br, bb, mask_pixels = sam3_bbox
+        used_sam3 = True
     else:
-        bl *= sx
-        br *= sx
-        bt *= sy
-        bb *= sy
+        bl, bt, br, bb = box.bbox_2d_vggt
+        if bl < 0 or bt < 0 or br < 0 or bb < 0:
+            corners_2d = project_points(corners_cam, frame["K_real"])
+            bl = float(corners_2d[:, 0].min())
+            bt = float(corners_2d[:, 1].min())
+            br = float(corners_2d[:, 0].max())
+            bb = float(corners_2d[:, 1].max())
+        else:
+            bl *= sx
+            br *= sx
+            bt *= sy
+            bb *= sy
 
     img_h = frame["image_height"]
     img_w = frame["image_width"]
@@ -401,6 +479,12 @@ def build_annotation(
     v_max = float(np.clip(corners_2d[:, 1].max(), 0, img_h - 1))
     bbox2D_proj = [u_min, v_min, u_max, v_max]
 
+    # When we have a SAM3 mask, also report a realistic segmentation_pts so
+    # the annotation filter can treat tiny / occluded animals reasonably.
+    # (Cap at 10000 so the default is_ignore() thresholds don't over-trust
+    # giant masks.)
+    seg_pts = min(mask_pixels, 10000) if used_sam3 and mask_pixels > 0 else 10
+
     return {
         "id": ann_id,
         "image_id": image_id,
@@ -419,12 +503,13 @@ def build_annotation(
         "R_cam": R_cam.tolist(),
         "truncation": 0.0,
         "visibility": 1.0,
-        "segmentation_pts": 10,
+        "segmentation_pts": seg_pts,
         "lidar_pts": 10,
         "depth_error": 0.0,
         "area": float(bbox_xywh[2] * bbox_xywh[3]),
         "iscrowd": 0,
         "track_id": box.track_id,
+        "bbox_source": "sam3" if used_sam3 else "vggt",
     }
 
 
@@ -454,6 +539,7 @@ def build_split_json(
         frames_seq = loaded["frames_seq"]
         boxes_by_frame = loaded["boxes_by_frame"]
         sx, sy = loaded["sx"], loaded["sy"]
+        sam3_boxes = loaded.get("sam3_boxes", {})
 
         s_scene = compute_scene_scale_cam(boxes_by_frame, frames_seq)
         scene_scales[seg["seg_id"]] = s_scene
@@ -480,6 +566,13 @@ def build_split_json(
             })
 
             for box in boxes:
+                # Look up SAM3 tight 2D bbox keyed by (track_id, frame_name).
+                # If absent (no SAM3 masks for this segment / this frame
+                # missing / this track_id not in SAM3), fall through to the
+                # VGGT/projection logic inside build_annotation.
+                sam3_key = (box.track_id, frame["image_name"])
+                sam3_bbox = sam3_boxes.get(sam3_key)
+
                 ann = build_annotation(
                     box=box,
                     frame=frame,
@@ -491,6 +584,7 @@ def build_split_json(
                     dataset_id=dataset_id,
                     category_id=category_id,
                     category_name=category_name,
+                    sam3_bbox=sam3_bbox,
                 )
                 if ann is None:
                     continue
@@ -664,9 +758,15 @@ def main():
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
             json.dump(data, f, indent=2)
+        n_sam3 = sum(1 for a in data["annotations"]
+                     if a.get("bbox_source") == "sam3")
+        n_total = len(data["annotations"])
+        pct = (100.0 * n_sam3 / max(n_total, 1))
         logger.info(
             f"[{split_name}] wrote {out_path} — {len(data['images'])} images, "
-            f"{len(data['annotations'])} annotations, {len(scales)} segments"
+            f"{n_total} annotations "
+            f"({n_sam3} with SAM3 tight 2D bbox = {pct:.1f}%), "
+            f"{len(scales)} segments"
         )
         if args.verbose:
             for sid, s in scales.items():

@@ -223,12 +223,37 @@ def main():
     # model's OWN contiguous ids. Useful after fine-tuning, where the model
     # learned which slot = which species -- tells you which class the
     # localizer struggles with.
-    classes_in_gt = {ann["category_id"] for ann in gt["annotations"]}
+    #
+    # CRITICAL: the contiguous-id <-> species mapping must match what the
+    # model was TRAINED with, not a naive sort of GT dataset-ids. The model
+    # stores this in category_meta.json after training:
+    #   thing_dataset_id_to_contiguous_id = {"1004": 0, "1002": 1, "1001": 2}
+    # So contiguous 0 = rhino, 1 = elephant, 2 = zebra -- NOT alphabetic /
+    # sorted-by-id. Load from configs/category_meta.json (the training-time
+    # metadata symlink) when available.
     cat_id_to_name = {c["id"]: c["name"] for c in gt["categories"]}
-    # Build dataset-id -> contiguous-id mapping from GT categories (sorted by id).
-    sorted_ids = sorted(c["id"] for c in gt["categories"])
-    dataset_to_contiguous = {cid: i for i, cid in enumerate(sorted_ids)}
-    contiguous_to_name = {i: cat_id_to_name[cid] for cid, i in dataset_to_contiguous.items()}
+    dataset_to_contiguous: dict[int, int] = {}
+    meta_path = Path("configs/category_meta.json")
+    if meta_path.exists():
+        try:
+            meta = json.load(open(meta_path))
+            dataset_to_contiguous = {
+                int(k): int(v)
+                for k, v in meta.get("thing_dataset_id_to_contiguous_id", {}).items()
+            }
+            print(f"  per-class mapping from configs/category_meta.json: "
+                  f"{sorted(dataset_to_contiguous.items())}")
+        except Exception as e:
+            print(f"  couldn't read category_meta.json ({e}); falling back to sorted-id")
+    if not dataset_to_contiguous:
+        # Fallback: sort GT dataset-ids. Only correct if training used this
+        # ordering, which it usually doesn't.
+        sorted_ids = sorted(c["id"] for c in gt["categories"])
+        dataset_to_contiguous = {cid: i for i, cid in enumerate(sorted_ids)}
+        print(f"  WARNING: per-class labels may be swapped -- sorted-id fallback used")
+    contiguous_to_name = {i: cat_id_to_name[cid]
+                          for cid, i in dataset_to_contiguous.items()
+                          if cid in cat_id_to_name}
 
     # Group GT by (image, contiguous_class)
     per_class_gt = {c: {} for c in contiguous_to_name}
