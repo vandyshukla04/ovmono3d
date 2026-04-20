@@ -1,0 +1,30 @@
+_BASE_: "OVMono3D_wildbox_finetune.yaml"
+DATASETS:
+  CATEGORY_NAMES: ('rhino', 'elephant', 'zebra', 'giraffe', 'gazelle')
+  CATEGORY_NAMES_NOVEL: ('rhino', 'elephant', 'zebra', 'giraffe', 'gazelle')
+  CATEGORY_NAMES_BASE: ('rhino', 'elephant', 'zebra', 'giraffe', 'gazelle')
+DATALOADER:
+  # Upweight rare classes so they appear at comparable frequency to
+  # the majority class. 0.25 is a stronger rebalance than the default
+  # 0.1; use 0.3 if the imbalance is severe.
+  REPEAT_THRESHOLD: 0.25
+  # Node is dataloader-bound at 4 workers (GPU was 54% util last run);
+  # bump to reduce GPU starvation.
+  NUM_WORKERS: 8
+SOLVER:
+  # 5 species, more data per epoch, longer schedule.
+  IMS_PER_BATCH: 4
+  BASE_LR: 0.001
+  MAX_ITER: 20000
+  STEPS: (12000, 18000)
+  WARMUP_ITERS: 500
+  CHECKPOINT_PERIOD: 1000
+  # Mixed precision -- ~1.5-2x speedup on A40 (Ampere tensor cores).
+  AMP:
+    ENABLED: True
+TEST:
+  EVAL_PERIOD: 2000
+  # In-loop Rel-AP3D is slow on CPU pytorch3d (~15 min/eval). Disable
+  # during training; run once on model_final.pth at the end.
+  EVAL_REL_AP3D: False
+OUTPUT_DIR: "output/ovmono3d_wildbox_wildlife5"
