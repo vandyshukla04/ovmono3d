@@ -84,10 +84,14 @@ import numpy as np
 logger = logging.getLogger("prepare_wildbox_dataset")
 
 
-def resolve_source_path(path: Path) -> Path:
+def resolve_source_path(path: Path) -> Optional[Path]:
     """Resolve a --source path. If it points at a .zip, auto-extract to a
     sibling directory `<name>_unzipped/` and return that directory. Idempotent:
     if the sibling directory already exists, skip extraction.
+
+    On missing path / corrupt zip / partial transfer, log a warning and
+    return None -- the caller should skip that source. This lets the prep
+    script proceed when some zips in a batch are still transferring.
 
     Heuristic for finding <video>/<seg>/vggt_results/ inside the zip:
       1. If the extracted root directly contains <video>/<seg>/vggt_results, use it.
@@ -106,9 +110,16 @@ def resolve_source_path(path: Path) -> Path:
             try:
                 with zipfile.ZipFile(path, "r") as zf:
                     zf.extractall(extract_dir)
+            except (zipfile.BadZipFile, OSError, EOFError) as e:
+                import shutil
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                logger.warning(
+                    f"SKIP: {path} is not a valid zip ({type(e).__name__}: "
+                    f"{e}). Likely a partial/in-progress transfer. Rerun "
+                    f"prep later with this source."
+                )
+                return None
             except Exception:
-                # If extraction fails partway, remove the partial dir so the
-                # next run starts clean instead of using broken data.
                 import shutil
                 shutil.rmtree(extract_dir, ignore_errors=True)
                 raise
@@ -132,7 +143,10 @@ def resolve_source_path(path: Path) -> Path:
                 continue
             break
         return candidate
-    raise SystemExit(f"--source path does not exist or is not a .zip: {path}")
+    logger.warning(
+        f"SKIP: --source path does not exist or is not a .zip: {path}"
+    )
+    return None
 
 
 @dataclass
@@ -656,13 +670,12 @@ def auto_split(segments: List[Dict], mode: str, val_fraction: float,
     return train, val
 
 
-def parse_source(entry: str) -> Source:
+def parse_source(entry: str) -> Optional[Source]:
     """Parse 'path=category:category_id' into a Source.
 
-    `path` may be a directory containing <video>/<seg>/vggt_results/,
-    or a .zip archive whose content (possibly under a single wrapper
-    directory) has that structure. Zips are auto-extracted to a
-    sibling `<name>_unzipped/` directory on first use.
+    Returns None if the path can't be resolved (e.g. .zip still
+    transferring / corrupt) so the main() loop can skip it with a warning
+    rather than aborting the whole run.
     """
     if "=" not in entry or ":" not in entry:
         raise SystemExit(f"--source entry '{entry}' must be "
@@ -675,6 +688,8 @@ def parse_source(entry: str) -> Source:
         raise SystemExit(f"--source: '{cid_str}' in '{entry}' is not an integer")
     raw = Path(path_str).expanduser()
     resolved = resolve_source_path(raw)
+    if resolved is None:
+        return None
     return Source(path=resolved, category_name=name, category_id=cid)
 
 
@@ -718,7 +733,16 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    sources = [parse_source(e) for e in args.sources]
+    raw_sources = [parse_source(e) for e in args.sources]
+    sources = [s for s in raw_sources if s is not None]
+    n_skipped = len(raw_sources) - len(sources)
+    if n_skipped > 0:
+        logger.warning(
+            f"{n_skipped} source(s) skipped due to missing / corrupt paths. "
+            f"Add them to datasets/pending_sources.txt and rerun when ready."
+        )
+    if not sources:
+        sys.exit("No valid sources. Aborting.")
     for s in sources:
         logger.info(f"Source: {s.path} -> {s.category_name} (id={s.category_id})")
 
