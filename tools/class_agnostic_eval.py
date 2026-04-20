@@ -395,6 +395,7 @@ def main():
                 print(f"  frac pairs NHD<{thr}: {frac:6.2f}%")
 
     print(f"\n=== per-class AP (model's own class assignments) ===")
+    per_class_rows: dict[str, dict[float, float]] = {}
     for c, name in contiguous_to_name.items():
         # Build aligned lists using GT images for this class
         ids = sorted(per_class_gt[c].keys())
@@ -412,10 +413,21 @@ def main():
                 b = np.zeros((0, 4))
             ppi.append((s, b))
             gpi.append(np.array(per_class_gt[c][iid]))
+        per_class_rows[name] = {}
         for t in args.iou_thresholds:
             ap = compute_ap_at_iou(ppi, gpi, t)
+            per_class_rows[name][t] = 100 * ap
             print(f"  {name:12s} AP@{t:.2f} = {100*ap:6.2f}  "
                   f"(gt_images={len(ids)}, preds_seen={sum(len(v) for v in per_class_preds[c].values())})")
+
+    # Macro-AP: equal-weighted mean of per-class APs. For long-tail data
+    # this is the honest "does the model work across all species" number.
+    if per_class_rows:
+        print(f"\n=== macro-AP (equal-weight mean across classes) ===")
+        for t in args.iou_thresholds:
+            vals = [row[t] for row in per_class_rows.values() if t in row]
+            if vals:
+                print(f"  macro AP@{t:.2f} = {float(np.mean(vals)):6.2f}")
 
 
 if __name__ == "__main__":
