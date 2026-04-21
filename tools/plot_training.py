@@ -93,23 +93,59 @@ def main():
     out_path = args.out or args.metrics.with_name("training_curves.png")
 
     # Auto-discover keys by regex on actual names observed in the file.
-    loss_2d = keys_matching(rows, r"^loss_(?!.*3d)(?!.*box3d)|total_loss")
-    loss_3d = keys_matching(rows, r"loss.*(3d|cube|xy|_z$|dims|pose|joint)")
-    ap2d_final = keys_matching(rows, r"(mode=2D|2D)/?(AP|AP50|AP75)$")
-    ap3d_final = keys_matching(rows, r"(mode=3D|3D)/?(AP|AP15|AP25|AP50)$")
-    if not ap2d_final:
-        ap2d_final = keys_matching(rows, r"^bbox_2D_?AP")
-    if not ap3d_final:
-        ap3d_final = keys_matching(rows, r"^bbox_3D_?AP")
-    nhd_keys = keys_matching(rows, r"(nhd|NHD)")
-    lr_keys = keys_matching(rows, r"^lr$")
+    # Detectron2 uses a variety of naming conventions; match them all.
+    all_k = all_keys(rows)
 
-    print("Auto-discovered keys:")
-    print(f"  2D losses ({len(loss_2d)}):", loss_2d[:10])
-    print(f"  3D losses ({len(loss_3d)}):", loss_3d[:10])
-    print(f"  2D AP    ({len(ap2d_final)}):", ap2d_final[:10])
-    print(f"  3D AP    ({len(ap3d_final)}):", ap3d_final[:10])
-    print(f"  NHD      ({len(nhd_keys)}):", nhd_keys[:10])
+    # 2D losses: anything that looks like a 2D-detection loss.
+    #   total_loss, loss_cls, loss_box_reg, loss_rpn_cls, loss_rpn_loc,
+    #   BoxHead/loss_cls, BoxHead/loss_box_reg, ...
+    loss_2d = [k for k in all_k if (
+        k == "total_loss"
+        or re.search(r"^loss_(cls|box_reg|rpn)", k)
+        or re.search(r"BoxHead/loss_", k)
+        or re.search(r"rpn/loss_", k, re.I)
+    )]
+
+    # 3D losses: cube head components.
+    loss_3d = [k for k in all_k if re.search(
+        r"(^|/)loss_(xy|z|dims|pose|joint|3d)\b|Cube/|total_3D_loss", k, re.I
+    )]
+
+    # LR
+    lr_keys = [k for k in all_k if k == "lr"]
+
+    # Eval AP. detectron2 emits one per metric, typically under bbox/AP,
+    # bbox/AP50, bbox/AP75 (2D), and custom keys for 3D / per-class.
+    def _ap_keys(mode_hint):
+        hits = []
+        for k in all_k:
+            kl = k.lower()
+            if mode_hint == "2d":
+                if re.search(r"(^|[/_ ])(bbox[_-]?2?d?|2d)[/_ ]?(ap|ap50|ap75|ap95)\b", kl):
+                    hits.append(k)
+                elif re.match(r"^(ap|ap50|ap75)$", kl):
+                    hits.append(k)
+            else:  # 3d
+                if re.search(r"(3d)[/_ ]?(ap|ap15|ap25|ap50)\b", kl):
+                    hits.append(k)
+                elif re.search(r"bbox_3d", kl):
+                    hits.append(k)
+        return sorted(set(hits))
+
+    ap2d_final = _ap_keys("2d")
+    ap3d_final = _ap_keys("3d")
+    nhd_keys = [k for k in all_k if re.search(r"nhd", k, re.I)]
+
+    print(f"\nAll metric keys in file ({len(all_k)} total):")
+    for k in all_k:
+        print(f"  {k}")
+
+    print("\nAuto-discovered keys:")
+    print(f"  2D losses ({len(loss_2d)}):", loss_2d[:15])
+    print(f"  3D losses ({len(loss_3d)}):", loss_3d[:15])
+    print(f"  2D AP    ({len(ap2d_final)}):", ap2d_final[:15])
+    print(f"  3D AP    ({len(ap3d_final)}):", ap3d_final[:15])
+    print(f"  NHD      ({len(nhd_keys)}):", nhd_keys[:15])
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 9))
     plot_group(axes[0, 0], rows, loss_2d, "2D losses")

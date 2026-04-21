@@ -88,32 +88,18 @@ def main():
 
     pred_by_img = {im["image_id"]: im for im in preds}
 
-    saved = 0
-    for i, img_id in enumerate(sorted(img_by_id.keys())):
-        if i % args.every != 0:
-            continue
-        if args.limit and saved >= args.limit:
-            break
-        img_info = img_by_id[img_id]
-        img_path = Path(img_info["file_path"])
-        if not img_path.is_absolute():
-            # Omni3D loader prepends "datasets/"
-            img_path = Path("datasets") / img_path
-        if not img_path.exists():
-            continue
+    # Separate output subdirs for GT, preds, combined — much easier to
+    # flip-compare by opening pair_NNNNNN.jpg from gt_only/ vs pred_only/.
+    (args.out / "gt_only").mkdir(parents=True, exist_ok=True)
+    (args.out / "pred_only").mkdir(parents=True, exist_ok=True)
+    (args.out / "combined").mkdir(parents=True, exist_ok=True)
 
-        im = cv2.imread(str(img_path))
-        if im is None:
-            continue
-
-        K = np.array(img_info["K"], dtype=np.float64)
-
-        # --- GT in green (2D) + dark green (3D) ---
-        for ann in ann_by_img.get(img_id, []):
+    def draw_gt(canvas, anns):
+        for ann in anns:
             x, y, w, h = ann["bbox"]
-            cv2.rectangle(im, (int(x), int(y)), (int(x+w), int(y+h)),
+            cv2.rectangle(canvas, (int(x), int(y)), (int(x+w), int(y+h)),
                           (0, 220, 0), 2)
-            cv2.putText(im, ann.get("category_name", ""),
+            cv2.putText(canvas, ann.get("category_name", ""),
                         (int(x), max(15, int(y) - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 2)
             if not args.no_3d and ann.get("valid3D", True):
@@ -124,50 +110,88 @@ def main():
                     corners3d = cuboid_corners(c, d, R)
                     if (corners3d[:, 2] > 0).all():
                         corners2d = project(corners3d, K)
-                        draw_cuboid_wireframe(im, corners2d, (0, 140, 0), 1)
+                        draw_cuboid_wireframe(canvas, corners2d, (0, 140, 0), 1)
                 except Exception:
                     pass
 
-        # --- Top-K predictions in red (2D) + dark red (3D) ---
+    def draw_preds(canvas, insts, top_k):
+        insts_sorted = sorted(insts, key=lambda x: -float(x.get("score", 0)))
+        for inst in insts_sorted[:top_k]:
+            score = float(inst.get("score", 0))
+            x, y, w, h = inst["bbox"]
+            cv2.rectangle(canvas, (int(x), int(y)), (int(x+w), int(y+h)),
+                          (0, 0, 220), 2)
+            cv2.putText(canvas, f"{score:.2f}",
+                        (int(x), max(15, int(y) - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 220), 2)
+            if args.no_3d:
+                continue
+            try:
+                c = np.array(inst["center_cam"], dtype=np.float64).reshape(-1)
+                d = np.array(inst["dimensions"], dtype=np.float64).reshape(-1)
+                pose = np.array(inst["pose"], dtype=np.float64)
+                if pose.size == 9:
+                    pose = pose.reshape(3, 3)
+                if c.size == 3 and d.size == 3 and pose.shape == (3, 3):
+                    corners3d = cuboid_corners(c, d, pose)
+                    if (corners3d[:, 2] > 0).all():
+                        corners2d = project(corners3d, K)
+                        draw_cuboid_wireframe(canvas, corners2d, (0, 0, 140), 1)
+            except Exception:
+                pass
+
+    saved = 0
+    for i, img_id in enumerate(sorted(img_by_id.keys())):
+        if i % args.every != 0:
+            continue
+        if args.limit and saved >= args.limit:
+            break
+        img_info = img_by_id[img_id]
+        img_path = Path(img_info["file_path"])
+        if not img_path.is_absolute():
+            img_path = Path("datasets") / img_path
+        if not img_path.exists():
+            continue
+
+        im_base = cv2.imread(str(img_path))
+        if im_base is None:
+            continue
+
+        K = np.array(img_info["K"], dtype=np.float64)
+        anns = ann_by_img.get(img_id, [])
         im_obj = pred_by_img.get(img_id)
+        insts = []
         if im_obj:
             insts = [inst for inst in im_obj.get("instances", [])
                      if float(inst.get("score", 0)) >= args.score_min]
-            insts.sort(key=lambda x: -float(x["score"]))
-            for inst in insts[:args.top_k]:
-                score = float(inst["score"])
-                x, y, w, h = inst["bbox"]
-                cv2.rectangle(im, (int(x), int(y)), (int(x+w), int(y+h)),
-                              (0, 0, 220), 2)
-                cv2.putText(im, f"{score:.2f}",
-                            (int(x), max(15, int(y) - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 220), 2)
-                if args.no_3d:
-                    continue
-                # 3D wireframe from center_cam + dimensions + pose
-                try:
-                    c = np.array(inst["center_cam"], dtype=np.float64).reshape(-1)
-                    d = np.array(inst["dimensions"], dtype=np.float64).reshape(-1)
-                    pose = np.array(inst["pose"], dtype=np.float64)
-                    if pose.size == 9:
-                        pose = pose.reshape(3, 3)
-                    if c.size == 3 and d.size == 3 and pose.shape == (3, 3):
-                        corners3d = cuboid_corners(c, d, pose)
-                        if (corners3d[:, 2] > 0).all():
-                            corners2d = project(corners3d, K)
-                            draw_cuboid_wireframe(im, corners2d, (0, 0, 140), 1)
-                except Exception:
-                    pass
 
-        # Legend
-        cv2.putText(im, "GT (green) | pred (red)", (10, 25),
+        # gt-only image
+        gt_img = im_base.copy()
+        draw_gt(gt_img, anns)
+        cv2.putText(gt_img, f"GT only  (id={img_id})", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2)
+        cv2.imwrite(str(args.out / "gt_only" / f"pair_{img_id:06d}.jpg"), gt_img)
+
+        # pred-only image
+        pred_img = im_base.copy()
+        draw_preds(pred_img, insts, args.top_k)
+        cv2.putText(pred_img, f"Pred only  (id={img_id}, top-{args.top_k})", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 220), 2)
+        cv2.imwrite(str(args.out / "pred_only" / f"pair_{img_id:06d}.jpg"), pred_img)
+
+        # combined (original behaviour)
+        combined = im_base.copy()
+        draw_gt(combined, anns)
+        draw_preds(combined, insts, args.top_k)
+        cv2.putText(combined, "GT (green) | pred (red)", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.imwrite(str(args.out / "combined" / f"pair_{img_id:06d}.jpg"), combined)
 
-        out_path = args.out / f"combined_{img_id:06d}.jpg"
-        cv2.imwrite(str(out_path), im)
         saved += 1
 
-    print(f"wrote {saved} images to {args.out}")
+    print(f"Wrote {saved} sample triplets (gt_only/, pred_only/, combined/) -> {args.out}")
+    print(f"To flip-compare: open {args.out}/gt_only/pair_NNNNNN.jpg and "
+          f"{args.out}/pred_only/pair_NNNNNN.jpg side-by-side.")
 
 
 if __name__ == "__main__":
