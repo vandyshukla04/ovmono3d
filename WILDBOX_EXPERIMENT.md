@@ -289,12 +289,21 @@ python tools/prepare_wildbox_dataset.py \
 
 For the current run (11 zips) the full command is in [datasets/pending_sources.txt](datasets/pending_sources.txt) (commented section "re-add command").
 
-### 4.3 Flip the eval-time symlink
+### 4.3 Flip BOTH eval-time symlinks
 
 ```bash
+# Top-level: used by external eval tools + stock Omni3D evaluator
 ln -sf wildbox/category_meta_wildlife5.json configs/category_meta.json
-cat configs/category_meta.json   # verify
+
+# Config-dir: used by tools/train_net.py --eval-only (reads from config file's dir)
+ln -sf category_meta_wildlife5.json configs/wildbox/category_meta.json
+
+# Verify both show identical content
+cat configs/category_meta.json
+cat configs/wildbox/category_meta.json
 ```
+
+`tools/run_full_eval.sh` auto-syncs these at the start of each invocation as a safety net (see §13).
 
 ### 4.4 No-leakage verification
 
@@ -808,15 +817,24 @@ print('OK: stats.json has all 5 species')
 "
 # If any missing: rerun tools/patch_stats_for_wildbox.py
 
-# [E] configs/category_meta.json is the 5-species symlink
-ls -la configs/category_meta.json | grep -q wildlife5 && \
-    echo "OK: symlink -> wildlife5" || \
-    { echo "BAD symlink — fixing..."; \
-      ln -sf wildbox/category_meta_wildlife5.json configs/category_meta.json; }
+# [E] BOTH category_meta.json files point to wildlife5
+for F in configs/category_meta.json configs/wildbox/category_meta.json; do
+    ls -la "$F" | grep -q wildlife5 && echo "OK: $F -> wildlife5" || {
+        echo "BAD symlink at $F — fixing..."
+        case "$F" in
+            configs/category_meta.json)
+                ln -sf wildbox/category_meta_wildlife5.json "$F" ;;
+            configs/wildbox/category_meta.json)
+                ln -sf category_meta_wildlife5.json "$F" ;;
+        esac
+    }
+done
 
 cat configs/category_meta.json
-# Must show thing_classes = ["rhino", "elephant", "zebra", "giraffe", "gazelle"]
-# And thing_dataset_id_to_contiguous_id = {"1004":0,"1002":1,"1001":2,"1000":3,"1005":4}
+cat configs/wildbox/category_meta.json
+# Both MUST show thing_classes = ["giraffe", "zebra", "elephant", "rhino", "gazelle"]
+# With mapping {"1000":0, "1001":1, "1002":2, "1004":3, "1005":4}
+# giraffe FIRST (smallest dataset-id 1000), gazelle LAST (1005)
 
 # [F] Val JSON healthy + no video-level leakage
 python -c "
