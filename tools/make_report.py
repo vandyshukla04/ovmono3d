@@ -81,31 +81,29 @@ def parse_standard_eval_log(log_path: Path) -> Dict[str, Any]:
                 result[mode][h] = v
 
     # Per-class blocks: "Per-category bbox AP/AR in <MODE> mode:"
+    # Robust parser: find the whole block between mode header and the next
+    # blank line / non-table line, then *globally* scan for "word (AP|AR)
+    # | value" pairs regardless of how cells align. This survives extra
+    # spacing, column variations, and log variants that confused the old
+    # index-based parser (which was silently dropping everything after
+    # the first matched row).
     per_cat_pat = re.compile(
         r"Per-category bbox AP/AR in (\S+) mode:\s*\n"
-        r"\|[^\n]*\|\s*\n"
-        r"\|[^\n]*\|\s*\n"
-        r"((?:\|[^\n]*\|\s*\n)+)",
+        r"((?:[^\n]*\n){1,60}?)"        # up to ~60 lines after header
+        r"(?:\n|\Z)",
         re.MULTILINE,
     )
+    pair_rx = re.compile(r"(\w[\w ]*?)\s*\((AP|AR)\)\s*\|\s*([-+0-9.]+)")
     for m in per_cat_pat.finditer(text):
         mode = m.group(1)
         body = m.group(2)
-        # Rows look like: "| rhino (AP) | 63.6 | rhino (AR) | 69.4 |"
-        for line in body.strip().splitlines():
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            # Pairs of (label, value) per row, 2 pairs per row
-            for i in range(0, len(cells) - 1, 2):
-                lbl = cells[i]
-                val = cells[i + 1]
-                mclass = re.match(r"(\w+)\s*\((AP|AR)\)", lbl)
-                if mclass:
-                    cls, metric = mclass.group(1), mclass.group(2)
-                    try:
-                        fv = float(val)
-                    except ValueError:
-                        continue
-                    result["per_class"].setdefault(mode, {}).setdefault(cls, {})[metric] = fv
+        for cls, metric, val in pair_rx.findall(body):
+            cls = cls.strip()
+            try:
+                fv = float(val)
+            except ValueError:
+                continue
+            result["per_class"].setdefault(mode, {}).setdefault(cls, {})[metric] = fv
 
     # Disentangled NHD: either in the 3D-mode table (columns) or in the
     # "Average Disentangled NHD Metrics:" block.
