@@ -105,6 +105,21 @@ def parse_standard_eval_log(log_path: Path) -> Dict[str, Any]:
                 continue
             result["per_class"].setdefault(mode, {}).setdefault(cls, {})[metric] = fv
 
+    # Sanity-check: if we have per-class data and all classes but one are
+    # exactly 0 for AP, the evaluator almost certainly ran with a broken
+    # class mapping (see WILDBOX_EXPERIMENT.md §4.3 -- symlink must match
+    # training's contiguous-id assignment). Warn loudly.
+    for mode, classes in result["per_class"].items():
+        aps = {c: d.get("AP", 0.0) for c, d in classes.items() if "AP" in d}
+        if len(aps) >= 3:
+            nonzero = [c for c, v in aps.items() if v > 0.01]
+            if len(nonzero) == 1 and len(aps) - len(nonzero) >= 2:
+                print(f"\n!! WARNING (mode={mode}): only '{nonzero[0]}' has "
+                      f"non-zero per-class AP; all others = 0. This is almost "
+                      f"always a class-mapping mismatch (wrong "
+                      f"configs/category_meta.json symlink at eval time). "
+                      f"See WILDBOX_EXPERIMENT.md §4.3.\n")
+
     # Disentangled NHD: either in the 3D-mode table (columns) or in the
     # "Average Disentangled NHD Metrics:" block.
     for key in ("overall_NHD", "disent_xy_NHD", "disent_z_NHD",
