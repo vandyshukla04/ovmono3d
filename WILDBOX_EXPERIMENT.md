@@ -120,12 +120,15 @@ Because this is **uniform scaling**, box shape / orientation / 2D projection / 3
 
 ### 2.8 Category metadata — the critical gotcha
 
-Two separate files, **DO NOT confuse**:
+**Three** files all need to agree. If any one disagrees with training's contiguous-id ordering, per-class metrics go silently wrong (usually zero for all-but-one class).
 
-| File | What | Where it's used |
+| File | What | Who reads it |
 |---|---|---|
 | `datasets/Omni3D/stats.json` | Global Omni3D category registry (ids 1000–1005 for wildlife) | Data loader + filter settings |
-| `configs/category_meta.json` | **SYMLINK** to the N-species meta for the *current* eval | External eval tools + stock Omni3D evaluator (in `CAT_MODE="novel"`) |
+| **`configs/wildbox/category_meta.json`** | **SYMLINK** used by `tools/train_net.py`'s `--eval-only` code path at line 402 (looks in the config file's directory) | **Standalone eval runs** |
+| `configs/category_meta.json` | **SYMLINK** used by the stock Omni3D evaluator when `CAT_MODE="novel"` and by external eval tools (`bev_ap_eval.py`, `class_agnostic_eval.py`, `make_report.py`) | In-training evaluator + external tools |
+
+**This lesson was learned the hard way on 2026-04-21**: `configs/wildbox/category_meta.json` was a leftover from the Phase-1 single-giraffe run and kept overriding `configs/category_meta.json` for all `--eval-only` invocations, producing eval tables with only giraffe populated. The fix was to symlink `configs/wildbox/category_meta.json` to the matching `category_meta_wildlife5.json` too. **Keep them in sync.**
 
 #### 2.8.1 The contiguous-id ordering rule (MUST follow)
 
@@ -152,15 +155,23 @@ The ground-truth `thing_classes` for 5 species:
 
 Since 2026-04-21, `tools/prepare_wildbox_dataset.py` writes the correct mapping to `configs/wildbox/category_meta_auto_<N>species.json` each time you re-prep. Prefer this over hand-edited meta files.
 
-#### 2.8.3 Verify before every eval
+#### 2.8.3 Verify before every eval — BOTH symlinks
 
 ```bash
-ln -sf wildbox/category_meta_wildlife5.json configs/category_meta.json    # or the auto file
+# Fix BOTH symlinks (they use different relative paths)
+ln -sf wildbox/category_meta_wildlife5.json configs/category_meta.json
+ln -sf category_meta_wildlife5.json         configs/wildbox/category_meta.json
+
+# Verify both
 cat configs/category_meta.json
+cat configs/wildbox/category_meta.json
+# Both must show identical content:
 # 1. Species count matches what you trained on
 # 2. thing_classes first entry has the SMALLEST dataset-id in its mapping
 # 3. For 5-species: giraffe (1000) must be thing_classes[0], gazelle (1005) last
 ```
+
+If either file is missing or out of sync, the standalone `--eval-only` will use the wrong mapping and per-class metrics will be wrong.
 
 If unsure, the auto-generated file from the most recent prep is always correct:
 ```bash
@@ -727,6 +738,10 @@ Expected: +5-10 3D AP, especially on long-tail.
 | `plot_training.py` key discovery + full key dump | new | Debug metric-key naming drift across detectron2 versions |
 | `remap_wildbox_paths.py` | new | Path rescue when data moves, without invalidating split |
 | `patch_stats_for_wildbox.py` idempotency | same | Re-running is safe |
+| **category_meta_wildlife*.json ordering fix** | both files + auto-gen in prep script | Training's auto mapping sorts by dataset-id; our hand-written meta didn't match → all per-class metrics collapsed to 0 for 4/5 classes. Fixed by matching the sort order and auto-generating from prep |
+| `make_report.py` detects single-nonzero-class case | `parse_standard_eval_log` | Loud warning when the above mapping bug recurs |
+| **`configs/wildbox/category_meta.json` symlinked to wildlife5** | new | `train_net.py --eval-only` (line 402) reads this path, not the top-level one. The old Phase-1 giraffe-only file was causing every --eval-only standalone run to report only giraffe |
+| `run_full_eval.sh` auto-syncs both category_meta files | | Prevents the two-files-diverge bug at the source |
 
 ---
 

@@ -45,6 +45,26 @@ fi
 
 mkdir -p "$OUT"
 
+# Keep the two category_meta.json files in sync. The --eval-only code path in
+# tools/train_net.py:402 reads the one next to the config file, while
+# external tools read the top-level one. If they disagree, per-class metrics
+# silently become wrong (the Phase-1 giraffe-only file bug of 2026-04-21).
+TOP_META="configs/category_meta.json"
+CFG_DIR_META="$(dirname "$CONFIG")/category_meta.json"
+if [[ -e "$TOP_META" ]]; then
+    TOP_TARGET="$(readlink -f "$TOP_META" 2>/dev/null || echo "$TOP_META")"
+    CFG_TARGET="$(readlink -f "$CFG_DIR_META" 2>/dev/null || echo "$CFG_DIR_META")"
+    if [[ "$TOP_TARGET" != "$CFG_TARGET" ]]; then
+        echo "!! $TOP_META and $CFG_DIR_META resolve to different files:"
+        echo "   $TOP_META -> $TOP_TARGET"
+        echo "   $CFG_DIR_META -> $CFG_TARGET"
+        echo "   Syncing $CFG_DIR_META to match $TOP_META ..."
+        # Use a basename symlink so it remains relative to the wildbox dir
+        top_basename=$(basename "$TOP_TARGET")
+        ln -sf "$top_basename" "$CFG_DIR_META"
+    fi
+fi
+
 echo "[1/4] Standard eval (2D + 3D, no Rel-AP3D) -> $OUT/log.txt"
 python tools/train_net.py --eval-only \
     --config-file "$CONFIG" \
