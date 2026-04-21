@@ -751,6 +751,7 @@ Expected: +5-10 3D AP, especially on long-tail.
 | `make_report.py` detects single-nonzero-class case | `parse_standard_eval_log` | Loud warning when the above mapping bug recurs |
 | **`configs/wildbox/category_meta.json` symlinked to wildlife5** | new | `train_net.py --eval-only` (line 402) reads this path, not the top-level one. The old Phase-1 giraffe-only file was causing every --eval-only standalone run to report only giraffe |
 | `run_full_eval.sh` auto-syncs both category_meta files | | Prevents the two-files-diverge bug at the source |
+| **`search_rel_scale` switched to per-block IoU computation + progress prints** | `cubercnn/evaluation/omni3d_evaluation.py` | Old flat-list approach built a `box3d_overlap(N_all × M_all)` matrix per scale: for 13k val images that's ~1.6B CPU pair comparisons per scale × 28 scales → never finishes. Per-(img, cat) blocks are orders of magnitude smaller. |
 
 ---
 
@@ -1294,6 +1295,123 @@ Do vary (and track in §19's template):
 - Loss weights (as required by the architecture)
 - Backbone pretraining source
 - LR schedule (fit to the architecture)
+
+---
+
+---
+
+## 21. Current state (as of 2026-04-22) — pick up here after context compaction
+
+This section captures exactly where the experiment stands so the next conversation can resume without re-deriving context.
+
+### 21.1 What's completed
+
+- 5-species training run: `output/wildbox_wl5_finetune/` — 10 000 iterations, batch 8, LR 2e-3, AMP, REPEAT_THRESHOLD 0.25. Final checkpoint: `output/wildbox_wl5_finetune/model_final.pth`.
+- Training-time iter-10000 eval (embedded in `output/wildbox_wl5_finetune/log.txt`) has all 5 classes populated correctly:
+  - 2D AP: 45.9, AP50 90.4, AP75 40.2
+  - Per-class 2D AP: elephant 72.8, rhino 54.6, zebra 37.1, gazelle 35.8, giraffe 29.2
+  - 3D AP: 16.1, AP15 25.4, AP25 16.4
+  - Per-class 3D AP: elephant 45.1, zebra 16.7, rhino 14.7, gazelle 2.3, giraffe 1.8
+  - Disentangled NHD: overall 5.64, xy 1.66, **z 4.74** (dominant), dims 0.76, pose 0.69
+- Training used 11 of 13 zips; 3 pending in [datasets/pending_sources.txt](datasets/pending_sources.txt).
+- Data prep produces SAM3-tight 2D + video-level split.
+- BEV AP + class-agnostic eval tools + report generator all working.
+
+### 21.2 The "per-class metrics are all 0 except giraffe" bug (now fixed)
+
+Cause: `tools/train_net.py` in `--eval-only` mode reads `category_meta.json` from the **config file's directory** ([line 402](tools/train_net.py#L402)), not from the top-level `configs/` directory. A leftover Phase-1 file at `configs/wildbox/category_meta.json` had `thing_classes = ["giraffe"]` and was overriding the correct wildlife5 mapping for every standalone eval.
+
+**Fix applied**: `configs/wildbox/category_meta.json` is now a symlink to `category_meta_wildlife5.json`. `tools/run_full_eval.sh` has a sanity check at start that auto-syncs both symlinks.
+
+### 21.3 The Rel-AP3D "stuck forever" bug (now fixed)
+
+Cause: `search_rel_scale` in [cubercnn/evaluation/omni3d_evaluation.py](cubercnn/evaluation/omni3d_evaluation.py) built ONE giant `box3d_overlap(N_all_preds × M_all_gt)` matrix per scale. For our 13 361-image val set: ~27k preds × ~59k GT = ~1.6B CPU pair comparisons per scale × 28 scales. Effectively never finishes.
+
+**Fix applied (commit pending)**: rewrote `search_rel_scale` to compute IoU **per-(image, category) block** instead of as one giant matrix. Sum of per-block comparisons is orders of magnitude smaller. Also added progress printing (`[rel_ap3d] s=X.XXX score=... elapsed=Ns eta=Ns`) so stuckness is observable in real time.
+
+### 21.4 Remaining work (do next)
+
+1. **Commit and push the Rel-AP3D fix** (next action — not yet pushed as of this doc update).
+
+2. **Pull on the cluster**:
+   ```bash
+   cd /storage2/3DOM/vshukla/repos/ovmono3d
+   git pull
+   ```
+
+3. **Wipe failed eval outputs** and rerun:
+   ```bash
+   rm -rf output/wildbox_wl5_finetuned_eval \
+          output/wildbox_wl5_finetuned_eval_rel \
+          output/wildbox_wl5_zeroshot_eval
+   ```
+
+4. **Run zero-shot** (skip Rel-AP3D — no in-vocab preds makes scale search meaningless):
+   ```bash
+   tmux new -s wb-zs
+   bash tools/run_full_eval.sh \
+       --weights checkpoints/ovmono3d_lift.pth \
+       --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
+       --out     output/wildbox_wl5_zeroshot_eval \
+       --label   "zero-shot (pretrained)" \
+       --gt      datasets/Omni3D/WildBox_val.json \
+       --skip-rel-ap3d
+   ```
+
+5. **Run fine-tuned with Rel-AP3D** (now using the patched per-block scale search — should complete in 15-30 min with progress prints):
+   ```bash
+   tmux new -s wb-ft
+   bash tools/run_full_eval.sh \
+       --weights output/wildbox_wl5_finetune/model_final.pth \
+       --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
+       --out     output/wildbox_wl5_finetuned_eval \
+       --label   "fine-tuned (5 species, 11-zip)" \
+       --gt      datasets/Omni3D/WildBox_val.json
+   ```
+
+6. **Build combined report**:
+   ```bash
+   python tools/make_report.py \
+       --run-dir output/wildbox_wl5_zeroshot_eval    --label "zero-shot" \
+       --run-dir output/wildbox_wl5_finetuned_eval   --label "fine-tuned" \
+       --gt      datasets/Omni3D/WildBox_val.json \
+       --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
+       --out     output/paper_report_final --compare
+   ```
+
+7. **Paper-figure visualizations**:
+   ```bash
+   python tools/visualize_class_agnostic.py \
+       --preds output/wildbox_wl5_finetune/inference/iter_final/WildBox_val/instances_predictions.pth \
+       --gt    datasets/Omni3D/WildBox_val.json \
+       --out   output/wildbox_wl5_finetune/vis_agnostic \
+       --top-k 3 --every 100 --limit 40
+
+   python tools/visualize_class_agnostic.py \
+       --preds output/wildbox_wl5_zeroshot_eval/inference/iter_final/WildBox_val/instances_predictions.pth \
+       --gt    datasets/Omni3D/WildBox_val.json \
+       --out   output/wildbox_wl5_zeroshot_eval/vis_agnostic \
+       --top-k 3 --every 100 --limit 40
+   ```
+
+### 21.5 Expected final paper numbers (fine-tuned, 11-zip data)
+
+Based on the training-log iter-10000 eval (which used the correct mapping):
+
+| Metric | Micro | Macro | rhino | elephant | zebra | giraffe | gazelle |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2D AP@0.5 | 90.4 | ~53 | ~82 | ~93 | ~75 | ~60 | ~73 |
+| 3D AP | 16.1 | ~16 | 14.7 | 45.1 | 16.7 | 1.8 | 2.3 |
+| Rel-AP3D | TBD — from step 5 | | | | | | |
+| AP_BEV@0.25 | TBD — from step 5 | | | | | | |
+
+The long-tail classes (giraffe 3D AP 1.8, gazelle 2.3) are the main weakness — motivates REPEAT_THRESHOLD bump to 0.5 for the next run (per §10.3 recommendations).
+
+### 21.6 Known pending
+
+- 3 zips still transferring: `data202401KElephants`, `data202401KRhinos`, `data202602KElephants`. Listed in [datasets/pending_sources.txt](datasets/pending_sources.txt). Retrain from scratch with all 13 once these arrive (§8.1).
+- pytorch3d CUDA rebuild never completed (cluster glibc blocks it). `search_rel_scale` now forces CPU tensors; this is the permanent state unless cluster glibc changes.
+- Giraffe has only 4 videos total (3 train, 1 val). Wide error bars expected; report 2-3 seeds per §10.3.
 
 ---
 

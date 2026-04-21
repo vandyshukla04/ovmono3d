@@ -1363,58 +1363,70 @@ class Omni3Deval(COCOeval):
         p = self.params
         cat_ids = p.catIds if p.useCats else [-1]
 
-        # Collect all (dt_corners, gt_corners) pairs that would be compared.
-        dt_list, gt_list, pair_index = [], [], []
+        # Collect (dt, gt) pairs organized as per-(image, category) BLOCKS.
+        # The previous implementation built two flat lists and computed one
+        # gigantic box3d_overlap(N_all, M_all) on CPU per scale — for 13k
+        # val images that's ~1.6 billion pair comparisons per scale and
+        # effectively never finishes. Instead, we keep each (image, cat)
+        # block separate and call box3d_overlap on the small block only.
+        # Sum of per-block products is orders of magnitude smaller than
+        # N_all * M_all.
+        blocks = []  # list of (dt_tensor, gt_tensor), each small
+        total_dt = total_gt = 0
         for img_id in p.imgIds:
             for cat_id in cat_ids:
                 gts = self._gts[img_id, cat_id]
                 dts = self._dts[img_id, cat_id]
                 if not gts or not dts:
                     continue
-                g = [gt["bbox3D"] for gt in gts]
-                d = [dt["bbox3D"] for dt in dts]
-                pair_index.append((len(dt_list), len(dt_list) + len(d),
-                                   len(gt_list), len(gt_list) + len(g)))
-                dt_list.extend(d)
-                gt_list.extend(g)
+                g = np.asarray([gt["bbox3D"] for gt in gts], dtype=np.float32)
+                d = np.asarray([dt["bbox3D"] for dt in dts], dtype=np.float32)
+                blocks.append((
+                    torch.from_numpy(d),   # (n_dt, 8, 3)
+                    torch.from_numpy(g),   # (n_gt, 8, 3)
+                ))
+                total_dt += len(d)
+                total_gt += len(g)
 
-        if not dt_list or not gt_list:
+        if not blocks:
             print("[rel_ap3d] no overlapping gt/dt pairs; keeping rel_scale = 1.0")
             self.rel_scale = 1.0
             return 1.0
 
-        # Force CPU: pytorch3d._C.iou_box3d has a CPU kernel in commit 055ab3a,
-        # but its CUDA kernel only exists if pytorch3d was built with FORCE_CUDA.
-        # On clusters where glibc blocks that build, we fall back to CPU here
-        # — same result, just slower. The regular AP3D path also runs on CPU
-        # tensors, so using CPU here makes the two code paths consistent.
-        device = torch.device("cpu")
-        dd_all = torch.tensor(dt_list, device=device, dtype=torch.float32)
-        gg_all = torch.tensor(gt_list, device=device, dtype=torch.float32)
+        print(f"[rel_ap3d] scale search: {len(blocks)} per-(img,cat) blocks, "
+              f"{total_dt} dt boxes total, {total_gt} gt boxes total, "
+              f"{len(scale_grid)} scale points")
 
         best_score = -1.0
         best_scale = 1.0
-        for s in scale_grid:
-            try:
-                ious_matrix = box3d_overlap(dd_all * float(s), gg_all).cpu().numpy()
-            except Exception as e:
-                print(f"[rel_ap3d] box3d_overlap failed at s={s}: {e}")
-                continue
-
+        t_start = time.time()
+        for si, s in enumerate(scale_grid):
             score = 0.0
-            for (d0, d1, g0, g1) in pair_index:
-                block = ious_matrix[d0:d1, g0:g1]
-                if block.size == 0:
+            failed = 0
+            for dt_t, gt_t in blocks:
+                try:
+                    ious = box3d_overlap(dt_t * float(s), gt_t).cpu().numpy()
+                except Exception:
+                    failed += 1
                     continue
-                # Best IoU per GT (greedy, matches APs intuition).
-                score += float(block.max(axis=0).sum())
-
+                if ious.size == 0:
+                    continue
+                # Best IoU per GT (greedy, matches AP intuition).
+                score += float(ious.max(axis=0).sum())
             if score > best_score:
                 best_score = score
                 best_scale = float(s)
+            elapsed = time.time() - t_start
+            if si == 0 or (si + 1) % 5 == 0 or si == len(scale_grid) - 1:
+                eta = (elapsed / (si + 1)) * (len(scale_grid) - si - 1)
+                print(f"[rel_ap3d]   s={float(s):.3f} score={score:.3f} "
+                      f"(best={best_score:.3f}@{best_scale:.3f}) "
+                      f"elapsed={elapsed:.0f}s eta={eta:.0f}s "
+                      + (f"[{failed} failed blocks]" if failed else ""))
 
         print(f"[rel_ap3d] best global scale = {best_scale:.4f} "
-              f"(sum of per-gt max IoU = {best_score:.3f})")
+              f"(sum of per-gt max IoU = {best_score:.3f}) "
+              f"in {time.time() - t_start:.0f}s")
         self.rel_scale = best_scale
 
         # Reset state so the caller's evaluate() recomputes from scratch.
