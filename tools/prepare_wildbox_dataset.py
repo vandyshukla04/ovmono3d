@@ -732,6 +732,9 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Silence PIL's chatty PNG chunk logs -- we read thousands of masks
+    # and each one prints IHDR/IDAT at DEBUG level, drowning our own logs.
+    logging.getLogger("PIL").setLevel(logging.WARNING)
 
     raw_sources = [parse_source(e) for e in args.sources]
     sources = [s for s in raw_sources if s is not None]
