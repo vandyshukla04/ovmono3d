@@ -133,15 +133,29 @@ def visualize_from_instances(detections, dataset, dataset_name, min_size_test, o
         K_inv = np.linalg.inv(K)
 
         sf = im_obj['height'] / min_size_test
+
+        # Helper: resolve a category_id to a (display_name, is_valid) pair
+        # regardless of whether the loader left ids in contiguous (0..N-1)
+        # or dataset (1000+) space. If we can't resolve a name, we still
+        # draw the box but label it generically rather than crashing.
+        def _cat_name(cid):
+            try:
+                cid_int = int(cid)
+            except (TypeError, ValueError):
+                return f"?"
+            if 0 <= cid_int < len(category_names_official):
+                return category_names_official[cid_int]
+            return f"cat_{cid_int}"
+
         if write_sample:
             for anno in annos:
-                if category_names_official[anno['category_id']] not in prompted_category_names:
+                name = _cat_name(anno['category_id'])
+                if name not in prompted_category_names and name != f"cat_{anno['category_id']}":
                     continue
                 x1, y1, x2, y2 = anno['bbox'][0], anno['bbox'][1], anno['bbox'][0] + anno['bbox'][2], anno['bbox'][1] + anno['bbox'][3]
                 color = util.get_color(anno['category_id'])
                 cv2.rectangle(im_gt_2d, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                # Add category label
-                cv2.putText(im_gt_2d, category_names_official[anno['category_id']], (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(im_gt_2d, name, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 gt_x3d, gt_y3d, gt_z3d = anno['center_cam']
                 gt_w3d, gt_h3d, gt_l3d = anno['dimensions']
                 gt_cen_2d = K @ np.array([gt_x3d, gt_y3d, gt_z3d])
@@ -149,14 +163,14 @@ def visualize_from_instances(detections, dataset, dataset_name, min_size_test, o
                 gt_pose = anno['pose']
                 gt_ry3d = np.array(gt_pose)
                 draw_3d_box(im_gt_3d, K, [gt_x3d, gt_y3d, gt_z3d, gt_w3d, gt_h3d, gt_l3d], gt_ry3d, color=color, thickness=int(np.round(3*im.shape[0]/500)), draw_back=False)
-                draw_text(im_gt_3d, category_names_official[anno['category_id']], anno['bbox'], scale=0.50*im.shape[0]/500, bg_color=color)
+                draw_text(im_gt_3d, name, anno['bbox'], scale=0.50*im.shape[0]/500, bg_color=color)
             # drawing ground truth 2d and 3d bboxes for all classes
             for anno in annos:
+                name = _cat_name(anno['category_id'])
                 x1, y1, x2, y2 = anno['bbox'][0], anno['bbox'][1], anno['bbox'][0] + anno['bbox'][2], anno['bbox'][1] + anno['bbox'][3]
                 color = util.get_color(anno['category_id'])
                 cv2.rectangle(im_gt_all_classes_2d, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                # Add category label
-                cv2.putText(im_gt_all_classes_2d, category_names_official[anno['category_id']], (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(im_gt_all_classes_2d, name, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 gt_x3d, gt_y3d, gt_z3d = anno['center_cam']
                 gt_w3d, gt_h3d, gt_l3d = anno['dimensions']
                 gt_cen_2d = K @ np.array([gt_x3d, gt_y3d, gt_z3d])
@@ -164,18 +178,15 @@ def visualize_from_instances(detections, dataset, dataset_name, min_size_test, o
                 gt_pose = anno['pose']
                 gt_ry3d = np.array(gt_pose)
                 draw_3d_box(im_gt_all_classes_3d, K, [gt_x3d, gt_y3d, gt_z3d, gt_w3d, gt_h3d, gt_l3d], gt_ry3d, color=color, thickness=int(np.round(3*im.shape[0]/500)), draw_back=False)
-                draw_text(im_gt_all_classes_3d, category_names_official[anno['category_id']], anno['bbox'], scale=0.50*im.shape[0]/500, bg_color=color)
+                draw_text(im_gt_all_classes_3d, name, anno['bbox'], scale=0.50*im.shape[0]/500, bg_color=color)
         
         for instance in im_obj['instances']:
 
             # The model head has NUM_CLASSES=50 output slots but the eval
-            # dataset may have fewer categories registered (e.g. 3 WildBox
-            # species). Skip predictions whose contiguous class id is out of
-            # range for the current category_names_official list rather than
-            # crashing the vis step.
-            if instance['category_id'] >= len(category_names_official):
-                continue
-            cat = category_names_official[instance['category_id']]
+            # dataset may have fewer categories registered. Use the same
+            # defensive lookup as GT so an out-of-range id becomes a generic
+            # label ("cat_N") rather than crashing vis.
+            cat = _cat_name(instance['category_id'])
             score = instance['score']
             x1, y1, w, h = instance['bbox']
             x2 = x1 + w 
