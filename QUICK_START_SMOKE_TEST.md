@@ -299,5 +299,5 @@ and [§21](WILDBOX_EXPERIMENT.md) for the current-state / resume context.
 - OVMono3D-style novel-view visualization (with + without ground grid) ✓
 
 If this smoke test passes end-to-end, the branch is ready for a full run
-(see WILDBOX_EXPERIMENT.md §15 for the scaled-up playbook with all 13
+(see WILDBOX_EXPERIMENT.md §15 for the scaled-up playbook with all 12
 zips and 15 000 training iterations).

@@ -10,7 +10,7 @@
 
 - **Task.** Monocular 3D detection of African wildlife from aerial drone footage.
 - **Species (current run).** rhino, elephant, zebra, giraffe, gazelle (5 classes).
-- **Dataset.** WildBox — custom, ~65k frames, ~243k bboxes, ~68 videos across 13 campaigns. 3D GT is pseudo-labels from SAM3 → VGGT pipeline.
+- **Dataset.** WildBox — custom, ~65k frames, ~243k bboxes, ~68 videos across 12 campaigns. 3D GT is pseudo-labels from SAM3 → VGGT pipeline.
 - **Architecture.** OVMono3D-lift (Cube R-CNN variant, DINOv2 ViT-B/14 backbone). Fine-tuned from `ovmono3d_lift.pth`.
 - **Training.** 10 000 iterations (batch 8, LR 2e-3, AMP, 8 workers). ~3.5 hours on A40. 20k iter schedule recommended for future runs (see §10).
 - **Primary metric.** AP-BEV @ IoU 0.25. Secondary: AP-3D @ 0.25, Rel-AP-3D (LabelAny3D), 2D AP @ 0.5.
@@ -26,7 +26,7 @@
 - Species labels via text-prompted SAM3 segmentation.
 - 3D cuboids via VGGT 3D reconstruction + tracking on the masked frames.
 
-### 2.2 Data inventory (13 campaigns)
+### 2.2 Data inventory (12 campaigns)
 
 Pending zip transfers are tracked in [datasets/pending_sources.txt](datasets/pending_sources.txt).
 
@@ -45,7 +45,7 @@ Pending zip transfers are tracked in [datasets/pending_sources.txt](datasets/pen
 | archive/data202501KGiraffes | giraffe | 310 | 391 | 2 | 2 |
 | archive/data202406KGazelles | gazelle | 7 443 | 59 399 | 39 | 4 |
 
-**Per-species totals (all 13 zips, target for full reproduction):**
+**Per-species totals (all 12 zips, target for full reproduction):**
 
 | Species | Frames | Bboxes | Segments | Videos |
 |---|---:|---:|---:|---:|
@@ -56,7 +56,7 @@ Pending zip transfers are tracked in [datasets/pending_sources.txt](datasets/pen
 | Gazelle | 7 443 | 59 399 | 39 | 4 |
 | **Total** | **~65 000** | **~243 000** | **~373** | **~68** |
 
-**Note on first run:** completed 2026-04-21 with 10 of 13 zips (2 elephant zips + 1 rhino zip were still transferring). Current model is "10-zip" data-ablation; full 13-zip retrain is the main paper result once transfers complete.
+**Note on first run:** completed 2026-04-21 with 10 of 12 zips (2 elephant zips + 1 rhino zip were still transferring). Current model is "10-zip" data-ablation; full 12-zip retrain is the main paper result once transfers complete.
 
 ### 2.3 Per-segment data layout
 
@@ -1184,7 +1184,7 @@ When running a new experiment (different architecture, different data split, dif
 | Date | 2026-04-22 | Chronological |
 | Architecture | `OVMono3D-lift DINOv2 ViT-B/14` | Change for ablations |
 | Pretrained weights | `checkpoints/ovmono3d_lift.pth` | Init choice |
-| Data sources | 11/13 zips (missing: data202401KR, data202401KE, data202602KE) | For fairness tracking |
+| Data sources | 11/12 zips (missing: data202401KR, data202401KE, data202602KE) | For fairness tracking |
 | Total frames | ~55 000 | Data size |
 | Split mode | video, seed=0, 0.2 val | Splitting protocol |
 | Species | rhino, elephant, zebra, giraffe, gazelle | Classes |
@@ -1315,7 +1315,7 @@ This section captures exactly where the experiment stands so the next conversati
   - 3D AP: 16.1, AP15 25.4, AP25 16.4
   - Per-class 3D AP: elephant 45.1, zebra 16.7, rhino 14.7, gazelle 2.3, giraffe 1.8
   - Disentangled NHD: overall 5.64, xy 1.66, **z 4.74** (dominant), dims 0.76, pose 0.69
-- Training used 11 of 13 zips; 3 pending in [datasets/pending_sources.txt](datasets/pending_sources.txt).
+- Training used 11 of 12 zips; 3 pending in [datasets/pending_sources.txt](datasets/pending_sources.txt).
 - Data prep produces SAM3-tight 2D + video-level split.
 - BEV AP + class-agnostic eval tools + report generator all working.
 
@@ -1411,7 +1411,7 @@ The long-tail classes (giraffe 3D AP 1.8, gazelle 2.3) are the main weakness —
 
 ### 21.6 Known pending
 
-- 3 zips still transferring: `data202401KElephants`, `data202401KRhinos`, `data202602KElephants`. Listed in [datasets/pending_sources.txt](datasets/pending_sources.txt). Retrain from scratch with all 13 once these arrive (§8.1).
+- 3 zips still transferring: `data202401KElephants`, `data202401KRhinos`, `data202602KElephants`. Listed in [datasets/pending_sources.txt](datasets/pending_sources.txt). Retrain from scratch with all 12 once these arrive (§8.1).
 - pytorch3d CUDA rebuild never completed (cluster glibc blocks it). `search_rel_scale` now forces CPU tensors; this is the permanent state unless cluster glibc changes.
 - Giraffe has only 4 videos total (3 train, 1 val). Wide error bars expected; report 2-3 seeds per §10.3.
 
