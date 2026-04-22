@@ -88,11 +88,32 @@ def main():
 
     pred_by_img = {im["image_id"]: im for im in preds}
 
-    # Separate output subdirs for GT, preds, combined — much easier to
-    # flip-compare by opening pair_NNNNNN.jpg from gt_only/ vs pred_only/.
-    (args.out / "gt_only").mkdir(parents=True, exist_ok=True)
-    (args.out / "pred_only").mkdir(parents=True, exist_ok=True)
-    (args.out / "combined").mkdir(parents=True, exist_ok=True)
+    # Two output layouts:
+    #   1. single-panel/  : separate images (gt.jpg, pred.jpg, overlay.jpg)
+    #                       for users who want to flip between them.
+    #   2. panels/        : ONE image per sample laid out as GT | PRED |
+    #                       OVERLAY side-by-side with giant banner titles.
+    #                       This is the "paper-figure" layout.
+    (args.out / "single-panel" / "gt").mkdir(parents=True, exist_ok=True)
+    (args.out / "single-panel" / "pred").mkdir(parents=True, exist_ok=True)
+    (args.out / "single-panel" / "overlay").mkdir(parents=True, exist_ok=True)
+    (args.out / "panels").mkdir(parents=True, exist_ok=True)
+
+    def _add_banner(img, text, color):
+        """Prepend a tall banner with label text across the top of img."""
+        banner_h = max(40, img.shape[0] // 20)
+        banner = np.full((banner_h, img.shape[1], 3), 32, dtype=np.uint8)  # dark gray
+        # 2-px colored stripe at the bottom of the banner
+        cv2.rectangle(banner, (0, banner_h - 3), (img.shape[1], banner_h),
+                      color, -1)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = banner_h / 60.0
+        thick = max(1, int(scale * 2))
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+        cv2.putText(banner, text,
+                    ((img.shape[1] - tw) // 2, (banner_h + th) // 2 - 4),
+                    font, scale, color, thick)
+        return np.vstack([banner, img])
 
     def draw_gt(canvas, anns):
         for ann in anns:
@@ -165,33 +186,54 @@ def main():
             insts = [inst for inst in im_obj.get("instances", [])
                      if float(inst.get("score", 0)) >= args.score_min]
 
-        # gt-only image
+        # Build the three individual panels with drawings applied.
         gt_img = im_base.copy()
         draw_gt(gt_img, anns)
-        cv2.putText(gt_img, f"GT only  (id={img_id})", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2)
-        cv2.imwrite(str(args.out / "gt_only" / f"pair_{img_id:06d}.jpg"), gt_img)
 
-        # pred-only image
         pred_img = im_base.copy()
         draw_preds(pred_img, insts, args.top_k)
-        cv2.putText(pred_img, f"Pred only  (id={img_id}, top-{args.top_k})", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 220), 2)
-        cv2.imwrite(str(args.out / "pred_only" / f"pair_{img_id:06d}.jpg"), pred_img)
 
-        # combined (original behaviour)
-        combined = im_base.copy()
-        draw_gt(combined, anns)
-        draw_preds(combined, insts, args.top_k)
-        cv2.putText(combined, "GT (green) | pred (red)", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.imwrite(str(args.out / "combined" / f"pair_{img_id:06d}.jpg"), combined)
+        overlay = im_base.copy()
+        draw_gt(overlay, anns)
+        draw_preds(overlay, insts, args.top_k)
+
+        # With banner titles for single-panel outputs
+        GT_COLOR = (0, 220, 0)      # BGR green
+        PRED_COLOR = (0, 0, 220)    # BGR red
+        OVERLAY_COLOR = (255, 255, 255)
+
+        n_gt = len(anns)
+        n_pred_shown = min(args.top_k, len(insts))
+        gt_titled = _add_banner(
+            gt_img, f"GROUND TRUTH  ({n_gt} box{'es' if n_gt != 1 else ''})  id={img_id}",
+            GT_COLOR)
+        pred_titled = _add_banner(
+            pred_img,
+            f"PREDICTIONS  (top {n_pred_shown} of {len(insts)}, score>={args.score_min:g})  id={img_id}",
+            PRED_COLOR)
+        overlay_titled = _add_banner(
+            overlay, f"OVERLAY  (GT green, Pred red)  id={img_id}",
+            OVERLAY_COLOR)
+
+        cv2.imwrite(str(args.out / "single-panel" / "gt" /
+                        f"img_{img_id:06d}.jpg"), gt_titled)
+        cv2.imwrite(str(args.out / "single-panel" / "pred" /
+                        f"img_{img_id:06d}.jpg"), pred_titled)
+        cv2.imwrite(str(args.out / "single-panel" / "overlay" /
+                        f"img_{img_id:06d}.jpg"), overlay_titled)
+
+        # Side-by-side panel: GT | PRED | OVERLAY (banners included).
+        # All three have same shape now because banners match image widths.
+        panel = np.hstack([gt_titled, pred_titled, overlay_titled])
+        cv2.imwrite(str(args.out / "panels" / f"img_{img_id:06d}.jpg"), panel)
 
         saved += 1
 
-    print(f"Wrote {saved} sample triplets (gt_only/, pred_only/, combined/) -> {args.out}")
-    print(f"To flip-compare: open {args.out}/gt_only/pair_NNNNNN.jpg and "
-          f"{args.out}/pred_only/pair_NNNNNN.jpg side-by-side.")
+    print(f"\nWrote {saved} samples to {args.out}/")
+    print(f"  panels/img_NNNNNN.jpg          — one image per sample: GT | PRED | OVERLAY side-by-side with banner titles (paper figures)")
+    print(f"  single-panel/gt/img_NNNNNN.jpg — GT boxes only, titled banner")
+    print(f"  single-panel/pred/...          — predictions only, titled banner")
+    print(f"  single-panel/overlay/...       — both overlaid, titled banner")
 
 
 if __name__ == "__main__":

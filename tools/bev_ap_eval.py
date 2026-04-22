@@ -101,10 +101,16 @@ def rotated_iou(poly_a: np.ndarray, poly_b: np.ndarray) -> float:
 # Extract BEV footprints from GT and predictions
 # -----------------------------------------------------------------------
 
-def gt_bev_by_img(gt: Dict) -> Dict[int, List[Dict]]:
-    """For each image_id, list of dicts with BEV polygon, category_id, and
-    2D bbox (used for display / debug only)."""
+def gt_bev_by_img(gt: Dict,
+                  dataset_id_to_contiguous: Dict[int, int]) -> Dict[int, List[Dict]]:
+    """For each image_id, list of dicts with BEV polygon and *contiguous*
+    category_id (0..N-1). The GT JSON stores dataset-ids (1000, 1002, etc.),
+    while predictions use contiguous-ids (0, 1, 2, ...). We MUST convert
+    here or the per-class filter later silently drops every GT box (0 GT,
+    0 AP for all classes).
+    """
     out: Dict[int, List[Dict]] = {}
+    dropped = 0
     for ann in gt["annotations"]:
         if not ann.get("valid3D", True) or ann.get("behind_camera", False):
             continue
@@ -117,10 +123,17 @@ def gt_bev_by_img(gt: Dict) -> Dict[int, List[Dict]]:
         poly = bev_footprint(center, dims, R)
         if poly is None:
             continue
+        dataset_id = int(ann["category_id"])
+        if dataset_id not in dataset_id_to_contiguous:
+            dropped += 1
+            continue
         out.setdefault(ann["image_id"], []).append({
             "poly": poly,
-            "category_id": int(ann["category_id"]),
+            "category_id": dataset_id_to_contiguous[dataset_id],
         })
+    if dropped:
+        print(f"  warn: {dropped} GT annotations had unmapped dataset_ids "
+              f"(not in category_meta.json mapping); dropped.")
     return out
 
 
@@ -251,9 +264,27 @@ def main():
     print(f"Loading GT {args.gt} ...", flush=True)
     gt = json.load(open(args.gt))
 
+    # Build contiguous-id mapping from category_meta BEFORE extracting GT.
+    meta_path = Path("configs/category_meta.json")
+    dataset_id_to_contiguous: Dict[int, int] = {}
+    if meta_path.exists():
+        try:
+            meta = json.load(open(meta_path))
+            dataset_id_to_contiguous = {
+                int(k): int(v)
+                for k, v in meta.get("thing_dataset_id_to_contiguous_id", {}).items()
+            }
+        except Exception as e:
+            print(f"  warn: couldn't read category_meta.json ({e})")
+    if not dataset_id_to_contiguous:
+        # Fallback: sort by dataset-id ascending (matches
+        # register_and_store_model_metadata's convention).
+        sorted_ids = sorted(c["id"] for c in gt["categories"])
+        dataset_id_to_contiguous = {cid: i for i, cid in enumerate(sorted_ids)}
+
     # Build per-image BEV polygons for GT + preds
     print("Building BEV footprints ...", flush=True)
-    gts_by_img = gt_bev_by_img(gt)
+    gts_by_img = gt_bev_by_img(gt, dataset_id_to_contiguous)
     preds_by_img = pred_bev_by_img(preds, score_min=args.score_min)
 
     n_preds_total = sum(len(v) for v in preds_by_img.values())
@@ -261,29 +292,25 @@ def main():
     print(f"  GT BEV footprints:   {n_gt_total} across {len(gts_by_img)} images")
     print(f"  Pred BEV footprints: {n_preds_total} across {len(preds_by_img)} images")
 
-    # Build contiguous-id -> name mapping from category_meta (training-time
-    # mapping) so per-class rows are correctly labeled. Falls back to GT
-    # category ordering if category_meta isn't available.
-    meta_path = Path("configs/category_meta.json")
+    # Build contiguous-id -> name mapping. Prefer category_meta.json but
+    # check that it's internally consistent: the position of each species
+    # in thing_classes must correspond to its contiguous-id from the mapping.
+    cat_id_to_name = {c["id"]: c["name"] for c in gt["categories"]}
     contiguous_to_name: Dict[int, str] = {}
     if meta_path.exists():
         try:
             meta = json.load(open(meta_path))
             thing_classes = meta.get("thing_classes", [])
-            cat_id_map = {int(k): int(v)
-                          for k, v in meta.get("thing_dataset_id_to_contiguous_id", {}).items()}
-            cat_id_to_name = {c["id"]: c["name"] for c in gt["categories"]}
-            for dataset_id, cid in cat_id_map.items():
+            for dataset_id, cid in dataset_id_to_contiguous.items():
                 if cid < len(thing_classes):
                     contiguous_to_name[cid] = thing_classes[cid]
                 elif dataset_id in cat_id_to_name:
                     contiguous_to_name[cid] = cat_id_to_name[dataset_id]
-        except Exception as e:
-            print(f"  warn: couldn't read category_meta.json ({e})")
+        except Exception:
+            pass
     if not contiguous_to_name:
-        cat_id_to_name = {c["id"]: c["name"] for c in gt["categories"]}
-        for i, cid in enumerate(sorted(cat_id_to_name.keys())):
-            contiguous_to_name[i] = cat_id_to_name[cid]
+        for dataset_id, cid in dataset_id_to_contiguous.items():
+            contiguous_to_name[cid] = cat_id_to_name.get(dataset_id, f"cat_{dataset_id}")
 
     print(f"  Per-class mapping: {sorted(contiguous_to_name.items())}")
 

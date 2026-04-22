@@ -81,16 +81,14 @@ def parse_standard_eval_log(log_path: Path) -> Dict[str, Any]:
                 result[mode][h] = v
 
     # Per-class blocks: "Per-category bbox AP/AR in <MODE> mode:"
-    # Robust parser: find the whole block between mode header and the next
-    # blank line / non-table line, then *globally* scan for "word (AP|AR)
-    # | value" pairs regardless of how cells align. This survives extra
-    # spacing, column variations, and log variants that confused the old
-    # index-based parser (which was silently dropping everything after
-    # the first matched row).
+    # Match the mode header, then consume consecutive markdown-table lines
+    # (lines starting with `|`). This stops cleanly at the next timestamp /
+    # log line and never accidentally absorbs the following mode's table.
+    # The pair_rx finds "species (AP|AR) | value" pairs globally within the
+    # body -- survives column alignment variations.
     per_cat_pat = re.compile(
         r"Per-category bbox AP/AR in (\S+) mode:\s*\n"
-        r"((?:[^\n]*\n){1,60}?)"        # up to ~60 lines after header
-        r"(?:\n|\Z)",
+        r"((?:\|[^\n]*\n)+)",
         re.MULTILINE,
     )
     pair_rx = re.compile(r"(\w[\w ]*?)\s*\((AP|AR)\)\s*\|\s*([-+0-9.]+)")
@@ -259,11 +257,19 @@ def render_main_table_md(runs: List[Dict[str, Any]], classes: List[str]) -> str:
         lines.append("| Metric | " + " | ".join(header_cols) + " |")
         lines.append("|" + "---|" * (len(header_cols) + 1))
         rows = [
+            # Headers reflect what each metric actually means:
+            #   - BEV micro/macro/per-class come from bev_ap.json (AP at
+            #     specified IoU; per-class is this same IoU for that class).
+            #   - AP_3D micro = AP25 (from 3D mode); per-class AP is IoU
+            #     0.05-0.50 mean (detectron2 only emits one aggregated per-
+            #     class AP in the table, regardless of threshold).
+            #   - Rel-AP_3D uses the 3D-Rel mode entries from the log.
+            #   - 2D AP micro = AP50; per-class is IoU 0.50:0.95 mean.
             ("AP_BEV @ 0.25", _bev_row(run, 0.25, classes)),
             ("AP_BEV @ 0.50", _bev_row(run, 0.50, classes)),
-            ("AP_3D @ 0.25",  _ap3d_row(run, "AP25", classes)),
-            ("Rel-AP_3D",      _relap_row(run, classes)),
-            ("2D AP @ 0.50",   _ap2d_row(run, "AP50", classes)),
+            ("AP_3D @ 0.25 (per-class: AP 0.05:0.50)",  _ap3d_row(run, "AP25", classes)),
+            ("Rel-AP_3D (per-class: AP 0.05:0.50)",      _relap_row(run, classes)),
+            ("AP_2D @ 0.50 (per-class: AP 0.50:0.95)",   _ap2d_row(run, "AP50", classes)),
         ]
         for name, vals in rows:
             lines.append(f"| **{name}** | " + " | ".join(vals) + " |")
@@ -313,6 +319,9 @@ def _relap_row(run: Dict[str, Any], classes: List[str]) -> List[str]:
 
 
 def _ap2d_row(run: Dict[str, Any], col: str, classes: List[str]) -> List[str]:
+    """2D AP row. `col` is the overall-metric column (e.g. "AP50", "AP").
+    Per-class values come from the per-category AP (single IoU=0.50:0.95
+    column, as detectron2 only reports one aggregated AP per class)."""
     log = run.get("log", {})
     micro = log.get("2D", {}).get(col)
     per_class = log.get("per_class", {}).get("2D", {})
