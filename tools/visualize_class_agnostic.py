@@ -1,21 +1,29 @@
 #!/usr/bin/env python
-"""Paper-quality 3D detection visualizations following the Cube R-CNN /
-OVMono3D convention.
+"""OVMono3D-style 3D detection visualizations, CPU-only.
 
-For each sampled image, produces a 2x3 panel grid:
+Faithfully ports the paper-figure "front-view + novel-view" layout from
+cubercnn/vis/vis.py:draw_scene_view to pure numpy + cv2, so it runs on
+clusters where pytorch3d's CUDA rasterizer is unavailable.
 
-    +---------------------+---------------------+---------------------+
-    | GT — 2D bounding    | GT — 3D cuboid      | GT — BEV (top-down) |
-    | boxes on image      | wireframes on image | cuboid footprints   |
-    +---------------------+---------------------+---------------------+
-    | PRED — 2D bounding  | PRED — 3D cuboid    | PRED — BEV          |
-    | boxes on image      | wireframes on image | cuboid footprints   |
-    +---------------------+---------------------+---------------------+
+For each sampled image, produces a 2x3 grid laid out as:
 
-Each panel has a titled banner at the top identifying what it shows.
-Per-instance coloring: each GT track (or each prediction) gets a
-distinct color consistently across its 2D box, 3D wireframe, and BEV
-footprint, so the eye can follow the same object across the three views.
+    +---------------+------------------+--------------------------+
+    | GT 2D BOXES   | GT 3D WIREFRAMES | GT NOVEL VIEW (60° pitch)|
+    +---------------+------------------+--------------------------+
+    | PRED 2D BOXES | PRED 3D WIREFR.  | PRED NOVEL VIEW          |
+    +---------------+------------------+--------------------------+
+
+The novel view is the OVMono3D default: `R = euler2mat([π/3, 0, 0])`
+(60° pitch tilted bird's-eye), scene auto-centered, auto-zoom to keep
+everything in frame, optional ground-plane grid (same drawing code as
+cubercnn's draw_scene_view, lines 469-571 ported to numpy).
+
+Two files per sample:
+    img_NNNNNN.jpg         -- ground grid ON  (paper-figure style)
+    img_NNNNNN_nogrid.jpg  -- ground grid OFF (cleaner)
+
+Per-instance colors are consistent across all three panels of a row,
+so you can follow the same animal from 2D → 3D → novel view by color.
 
 Usage:
     python tools/visualize_class_agnostic.py \\
@@ -27,6 +35,7 @@ Usage:
 import argparse
 import colorsys
 import json
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -36,8 +45,22 @@ import torch
 
 
 # ---------------------------------------------------------------------
-# Geometry
+# Core geometry (mirrors cubercnn.util.euler2mat and verts construction)
 # ---------------------------------------------------------------------
+
+def euler2mat(euler):
+    """Same as cubercnn.util.math_util.euler2mat."""
+    rx = np.array([[1, 0, 0],
+                   [0, math.cos(euler[0]), -math.sin(euler[0])],
+                   [0, math.sin(euler[0]),  math.cos(euler[0])]])
+    ry = np.array([[math.cos(euler[1]), 0, math.sin(euler[1])],
+                   [0, 1, 0],
+                   [-math.sin(euler[1]), 0, math.cos(euler[1])]])
+    rz = np.array([[math.cos(euler[2]), -math.sin(euler[2]), 0],
+                   [math.sin(euler[2]),  math.cos(euler[2]), 0],
+                   [0, 0, 1]])
+    return rz @ ry @ rx
+
 
 def project(points3d: np.ndarray, K: np.ndarray) -> np.ndarray:
     xs = points3d[:, 0] / points3d[:, 2]
@@ -48,6 +71,7 @@ def project(points3d: np.ndarray, K: np.ndarray) -> np.ndarray:
 
 
 def cuboid_corners(center, dims_whl, R):
+    """Omni3D corner ordering: L=X-ext, H=Y-ext, W=Z-ext."""
     W, H, L = float(dims_whl[0]), float(dims_whl[1]), float(dims_whl[2])
     local = np.array([
         [-L/2, -H/2, -W/2], [+L/2, -H/2, -W/2],
@@ -58,232 +82,298 @@ def cuboid_corners(center, dims_whl, R):
     return (R @ local.T).T + np.asarray(center, dtype=np.float64)
 
 
-# 12 edges of a cuboid given the corner ordering above
-CUBOID_EDGES = [(0,1),(1,2),(2,3),(3,0),
-                (4,5),(5,6),(6,7),(7,4),
-                (0,4),(1,5),(2,6),(3,7)]
-
-# Corners 0-3 form the BOTTOM face (min Y), 4-7 form the TOP face.
-# For BEV projection we take the bottom face (min-Y 4 corners).
-BEV_BOTTOM_IDX = [0, 1, 2, 3]
+# Edge list used by cubercnn's draw_3d_box_from_verts (vis.py:676)
+BB3D_EDGES = [[0, 1], [1, 2], [2, 3], [3, 0],
+              [1, 5], [5, 6], [6, 2], [4, 5],
+              [4, 7], [6, 7], [0, 4], [3, 7]]
 
 
 # ---------------------------------------------------------------------
-# Per-instance coloring
+# Cuboid wireframe drawing (CPU port of cubercnn.vis.vis.draw_3d_box_from_verts)
+# ---------------------------------------------------------------------
+
+def draw_3d_wireframe(im, K, verts3d, color, thickness,
+                     zplane=0.05, eps=1e-4):
+    """Same behavior as cubercnn.vis.vis.draw_3d_box_from_verts:
+    clips edges that cross the camera plane so lines project sensibly
+    even when a cuboid corner is at the camera's back."""
+    K = np.asarray(K, dtype=np.float64)
+    v = np.asarray(verts3d, dtype=np.float64)
+    for (i, j) in BB3D_EDGES:
+        v0 = v[i].copy()
+        v1 = v[j].copy()
+        z0, z1 = v0[-1], v1[-1]
+        if z0 >= zplane or z1 >= zplane:
+            s = (zplane - z0) / max((z1 - z0), eps)
+            new_v = v0 + s * (v1 - v0)
+            if z0 < zplane <= z1:
+                v0 = new_v
+            elif z1 < zplane <= z0:
+                v1 = new_v
+            p0 = (K @ v0) / max(v0[-1], eps)
+            p1 = (K @ v1) / max(v1[-1], eps)
+            cv2.line(im,
+                     (int(p0[0]), int(p0[1])),
+                     (int(p1[0]), int(p1[1])),
+                     color, thickness, cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------
+# Per-instance coloring (same instance → same color across panels)
 # ---------------------------------------------------------------------
 
 def _color_for(idx: int) -> Tuple[int, int, int]:
-    """Return a distinct BGR color for the given instance index by cycling
-    through 12 hues at high saturation. Stable across panels so the same
-    object gets the same color in 2D, 3D and BEV views."""
-    hue = (idx * 30 + 10) % 360  # 30-degree steps
+    hue = (idx * 30 + 10) % 360
     r, g, b = colorsys.hsv_to_rgb(hue / 360.0, 0.85, 0.95)
     return (int(b * 255), int(g * 255), int(r * 255))  # BGR
 
 
 # ---------------------------------------------------------------------
-# Panel drawers
+# Banner header for each panel
 # ---------------------------------------------------------------------
 
-def _font_scale(img_h: int) -> float:
-    return max(0.5, img_h / 1000.0)
-
-
-def _add_banner(img: np.ndarray, text: str, color: Tuple[int, int, int]) -> np.ndarray:
+def _add_banner(img, text, color):
     banner_h = max(40, img.shape[0] // 20)
     banner = np.full((banner_h, img.shape[1], 3), 32, dtype=np.uint8)
     cv2.rectangle(banner, (0, banner_h - 3), (img.shape[1], banner_h),
                   color, -1)
-    font = cv2.FONT_HERSHEY_SIMPLEX
     scale = banner_h / 55.0
     thick = max(2, int(scale * 2))
-    (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
+                                  scale, thick)
     cv2.putText(banner, text,
                 ((img.shape[1] - tw) // 2, (banner_h + th) // 2 - 4),
-                font, scale, color, thick)
+                cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick)
     return np.vstack([banner, img])
 
 
-def draw_2d_panel(base_img: np.ndarray,
-                  instances: List[dict],
-                  font_scale: float,
-                  thickness_2d: int) -> np.ndarray:
-    """2D bounding boxes only (no wireframes)."""
-    out = base_img.copy()
+# ---------------------------------------------------------------------
+# Front-view panels: 2D boxes only, 3D wireframes only
+# ---------------------------------------------------------------------
+
+def _draw_label(canvas, xy, text, color, font_scale=0.6):
+    (tw, th), bl = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
+                                   font_scale, 2)
+    x = max(0, int(xy[0]))
+    y = max(int(xy[1]), th + 4)
+    cv2.rectangle(canvas, (x, y - th - 4), (x + tw + 4, y + bl),
+                  color, -1)
+    cv2.putText(canvas, text, (x + 2, y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                (255, 255, 255), 2)
+
+
+def draw_2d_panel(base, instances, thickness):
+    out = base.copy()
+    font = max(0.5, out.shape[0] / 1000.0)
     for i, inst in enumerate(instances):
         color = _color_for(i)
         x1, y1, x2, y2 = inst["box2d_xyxy"]
         cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)),
-                      color, thickness_2d)
-        label = inst.get("label", f"#{i}")
-        # Background for text
-        (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
-                                       font_scale, 2)
-        y_txt = max(int(y1) - 4, th + 4)
-        cv2.rectangle(out,
-                      (int(x1), y_txt - th - 4),
-                      (int(x1) + tw + 4, y_txt + bl),
-                      color, -1)
-        cv2.putText(out, label, (int(x1) + 2, y_txt),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2)
+                      color, thickness)
+        _draw_label(out, (x1, y1 - 4), inst.get("label", f"#{i}"),
+                    color, font_scale=font)
     return out
 
 
-def draw_3d_panel(base_img: np.ndarray,
-                  instances: List[dict],
-                  K: np.ndarray,
-                  thickness_3d: int,
-                  font_scale: float) -> np.ndarray:
-    """3D cuboid wireframes only (projected onto image)."""
-    out = base_img.copy()
-    for i, inst in enumerate(instances):
-        corners3d = inst.get("corners3d")
-        if corners3d is None:
-            continue
-        if not (corners3d[:, 2] > 0).all():
-            continue
-        color = _color_for(i)
-        corners2d = project(corners3d, K)
-        for a, b in CUBOID_EDGES:
-            pa = tuple(int(v) for v in corners2d[a])
-            pb = tuple(int(v) for v in corners2d[b])
-            cv2.line(out, pa, pb, color, thickness_3d, cv2.LINE_AA)
-        # Draw a small marker at the projection of the center
-        center3d = corners3d.mean(axis=0)
-        if center3d[2] > 0:
-            cpt = project(center3d[None], K)[0]
-            cv2.circle(out, (int(cpt[0]), int(cpt[1])), thickness_3d + 1,
-                       color, -1)
-        # Label at top-front corner (corner 4 in our ordering)
-        lp = corners2d[4]
-        label = inst.get("label", f"#{i}")
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
-                                      font_scale, 2)
-        cv2.rectangle(out,
-                      (int(lp[0]), int(lp[1]) - th - 4),
-                      (int(lp[0]) + tw + 4, int(lp[1])),
-                      color, -1)
-        cv2.putText(out, label,
-                    (int(lp[0]) + 2, int(lp[1]) - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2)
-    return out
-
-
-def draw_bev_panel(instances: List[dict],
-                   size: Tuple[int, int] = (720, 720),
-                   margin: float = 0.15) -> np.ndarray:
-    """Top-down bird's-eye view of the cuboid footprints. Camera is at the
-    bottom-center pointing upward (+Z into the image). X is horizontal,
-    Z depth-ish (vertical).
-    """
-    H, W = size
-    canvas = np.full((H, W, 3), 240, dtype=np.uint8)  # light gray
-
-    # Gather footprints (bottom face) in XZ
-    foot_sets = []
-    for inst in instances:
-        c = inst.get("corners3d")
+def draw_3d_front_panel(base, instances, K, thickness):
+    out = base.copy()
+    font = max(0.5, out.shape[0] / 1000.0)
+    # Depth-sort: far first, so near ones end up on top.
+    order = sorted(range(len(instances)),
+                   key=lambda i: -(instances[i]["corners3d"].mean(0)[2]
+                                   if instances[i]["corners3d"] is not None
+                                   else -1e9))
+    for i in order:
+        inst = instances[i]
+        c = inst["corners3d"]
         if c is None:
             continue
-        foot = c[BEV_BOTTOM_IDX][:, [0, 2]]  # (4, 2) in (x, z)
-        foot_sets.append(foot)
+        color = _color_for(i)
+        draw_3d_wireframe(out, K, c, color, thickness)
+        # Label at top-front corner (idx 4 in our ordering)
+        if c[4, 2] > 0:
+            p = project(c[4:5], K)[0]
+            _draw_label(out, (p[0], p[1]), inst.get("label", f"#{i}"),
+                        color, font_scale=font)
+    return out
 
-    if not foot_sets:
-        cv2.putText(canvas, "no 3D boxes", (20, H // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
+
+# ---------------------------------------------------------------------
+# Novel-view panel — ported from cubercnn.vis.vis.draw_scene_view (CPU)
+# ---------------------------------------------------------------------
+
+def novel_view_panel(K, im_shape, instances, out_size,
+                     pitch_rad=math.pi / 3,
+                     with_grid=True,
+                     thickness=4,
+                     bg=(245, 245, 245),
+                     grid_color=(175, 175, 175)):
+    """Render cuboid wireframes from a novel viewpoint rotated by
+    pitch_rad about the scene center. Optionally draws a projected
+    ground-plane grid. CPU-only, no pytorch3d.
+
+    Replicates the geometry in cubercnn/vis/vis.py:draw_scene_view
+    (mode='novel' path, lines 395-613) without the rasterized mesh render.
+    """
+    H, W = out_size, out_size  # square canvas, matches OVMono3D demo
+    canvas = np.full((H, W, 3), bg, dtype=np.uint8)
+
+    # Gather cuboid verts with valid 3D geometry
+    vis_insts = [inst for inst in instances if inst["corners3d"] is not None]
+    if not vis_insts:
+        cv2.putText(canvas, "no 3D boxes to render", (20, H // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
         return canvas
 
-    all_xz = np.concatenate(foot_sets, axis=0)
-    x_min, x_max = all_xz[:, 0].min(), all_xz[:, 0].max()
-    z_min, z_max = max(0.0, all_xz[:, 1].min()), all_xz[:, 1].max()
-    # Widen so the plot has room & camera origin is visible
-    dx = x_max - x_min
-    dz = z_max - z_min
-    span = max(dx, dz, 1e-6) * (1 + margin * 2)
-    cx = (x_min + x_max) / 2
-    cz = (z_min + z_max) / 2
-    x_lo = cx - span / 2
-    x_hi = cx + span / 2
-    z_lo = max(0.0, cz - span / 2)
-    z_hi = cz + span / 2
-    if z_hi - z_lo < 1e-6:
-        z_hi = z_lo + 1.0
-    # z_lo can't be above camera (0); force include origin
-    z_lo = min(z_lo, 0.0)
+    all_verts = np.concatenate([i["corners3d"] for i in vis_insts], axis=0)
 
-    def xz_to_px(pt):
-        x, z = float(pt[0]), float(pt[1])
-        u = (x - x_lo) / (x_hi - x_lo) * W
-        v = H - (z - z_lo) / (z_hi - z_lo) * H
-        return int(u), int(v)
+    # --- scene center (same convention as draw_scene_view) ---
+    vmin = all_verts.min(axis=0)
+    vmax = all_verts.max(axis=0)
+    center = (vmin + vmax) / 2.0
+    max_y = vmax[1]  # ground plane = max-y (Y points down in camera frame)
 
-    # Grid
-    gridc = (200, 200, 200)
-    # Vertical lines (x=const) at integer values
-    x_step = max(1.0, round(span / 10.0))
-    x_val = np.floor(x_lo / x_step) * x_step
-    while x_val <= x_hi:
-        u, _ = xz_to_px((x_val, z_lo))
-        cv2.line(canvas, (u, 0), (u, H), gridc, 1)
-        x_val += x_step
-    z_val = np.floor(z_lo / x_step) * x_step
-    while z_val <= z_hi:
-        _, v = xz_to_px((0, z_val))
-        cv2.line(canvas, (0, v), (W, v), gridc, 1)
-        z_val += x_step
+    # Rotation about scene center (60° pitch by default)
+    view_R = euler2mat([pitch_rad, 0, 0])
 
-    # Camera icon at (0, 0), looking upward (+z)
-    cam_u, cam_v = xz_to_px((0.0, 0.0))
-    cam_tri = np.array([
-        [cam_u, cam_v - 18],
-        [cam_u - 12, cam_v + 8],
-        [cam_u + 12, cam_v + 8],
-    ], dtype=np.int32)
-    cv2.fillPoly(canvas, [cam_tri], (50, 50, 50))
-    cv2.putText(canvas, "cam", (cam_u + 14, cam_v + 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 1)
+    # Intrinsics for the novel-view canvas (scaled principal point)
+    K_nv = np.array(K, dtype=np.float64).copy()
+    K_nv[0, -1] *= W / im_shape[1]
+    K_nv[1, -1] *= H / im_shape[0]
 
-    # Axis labels
-    cv2.putText(canvas, "+X -->", (W - 90, H - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 80, 80), 2)
-    cv2.putText(canvas, "+Z", (12, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 80, 80), 2)
+    # --- Auto-zoom logic (port of draw_scene_view lines 425-454) ---
+    def rotate_verts(v):
+        return (view_R @ (v - center).T).T
 
-    # Footprints, polygon per instance
-    for i, inst in enumerate(instances):
-        c = inst.get("corners3d")
-        if c is None:
-            continue
-        color = _color_for(i)
-        # Use the convex hull of all 8 corners in XZ to be robust to any
-        # axis-convention quirks (some 3D heads emit cuboids where "bottom"
-        # depends on sign of Y).
-        xz = c[:, [0, 2]]
-        try:
-            from scipy.spatial import ConvexHull
-            hull = ConvexHull(xz)
-            poly = xz[hull.vertices]
-        except Exception:
-            poly = xz
-        px_poly = np.array([xz_to_px(p) for p in poly], dtype=np.int32)
-        # Fill with 30% alpha-like by drawing on a copy then blending
-        fill = canvas.copy()
-        cv2.fillPoly(fill, [px_poly], color)
-        canvas = cv2.addWeighted(fill, 0.35, canvas, 0.65, 0)
-        cv2.polylines(canvas, [px_poly], True, color, 3, cv2.LINE_AA)
-        # Label at centroid
-        cent = px_poly.mean(axis=0).astype(int)
-        label = inst.get("label", f"#{i}")
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
-                                      0.55, 2)
-        cv2.rectangle(canvas,
-                      (cent[0] - tw // 2 - 2, cent[1] - th // 2 - 2),
-                      (cent[0] + tw // 2 + 2, cent[1] + th // 2 + 4),
-                      color, -1)
-        cv2.putText(canvas, label,
-                    (cent[0] - tw // 2, cent[1] + th // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    base_rot = rotate_verts(all_verts)
 
+    # Starting zoom_factor, shrink until some vertex leaves margin or
+    # goes behind camera, then step back.
+    zoom_factor = 100.0
+    zoom_factor_in = zoom_factor
+    margin = 0.01
+    max_trials = 10000
+    best_zoom = zoom_factor
+
+    while max_trials > 0:
+        zoom_factor_in *= 0.95
+        verts = base_rot.copy()
+        verts[:, -1] += center[-1] * zoom_factor_in
+        if (verts[:, -1] < 0.25).any():
+            break
+        proj = (K_nv @ verts.T) / verts[:, -1]
+        if (proj[:2, :] < W * margin).any():
+            break
+        if (proj[:2, :] > W * (1 - margin)).any():
+            break
+        best_zoom = zoom_factor_in
+        max_trials -= 1
+
+    zoom_out_bias = float(center[-1])
+    zoom_factor = best_zoom
+
+    def transform(v):
+        r = rotate_verts(v)
+        r[:, -1] += zoom_out_bias * zoom_factor
+        return r
+
+    # --- Ground-plane grid (port of draw_scene_view lines 469-571) ---
+    if with_grid:
+        # First-pass: huge grid to find what's visible
+        min_x3d, _, min_z3d = vmin.tolist()
+        max_x3d, _, max_z3d = vmax.tolist()
+        span_x = max(max_x3d - min_x3d, 1e-3)
+        span_z = max(max_z3d - min_z3d, 1e-3)
+        x0 = round(min_x3d - span_x * 50)
+        x1 = round(max_x3d + span_x * 50)
+        z0 = round(min_z3d - span_z * 50)
+        z1 = round(max_z3d + span_z * 50)
+        # Stride the grid cheaply
+        step = max(1.0, int(max(x1 - x0, z1 - z0) / 200))
+        grid_xs = np.arange(x0, x1, step)
+        grid_zs = np.arange(z0, z1, step)
+        xs_mesh, zs_mesh = np.meshgrid(grid_xs, grid_zs)
+        ys_mesh = np.ones_like(xs_mesh) * max_y
+        pts = np.stack([xs_mesh, ys_mesh, zs_mesh], axis=-1).reshape(-1, 3)
+        pts_t = transform(pts)
+        pts_t[:, -1] = np.clip(pts_t[:, -1], 0.25, None)
+        pts_2d = (K_nv @ pts_t.T).T
+        pts_2d[:, :2] /= pts_2d[:, 2:]
+        # Find the sensible bounds based on which grid points project in-canvas
+        in_x = (pts_2d[:, 0] >= -50) & (pts_2d[:, 0] < W + 50) & (pts_2d[:, 2] > 0)
+        in_z = (pts_2d[:, 1] >= -50) & (pts_2d[:, 1] < H + 50) & (pts_2d[:, 2] > 0)
+        if in_x.any() and in_z.any():
+            x3d_start = round(pts[:, 0][in_x].min() - 10)
+            x3d_end = round(pts[:, 0][in_x].max() + 10)
+            z3d_start = round(pts[:, 2][in_z].min() - 10)
+            z3d_end = round(pts[:, 2][in_z].max() + 10)
+            grid_xs = np.arange(x3d_start, x3d_end + 1)
+            grid_zs = np.arange(z3d_start, z3d_end + 1)
+            # Subsample if too dense
+            max_lines = 60
+            if len(grid_xs) > max_lines:
+                grid_xs = grid_xs[::max(1, len(grid_xs) // max_lines)]
+            if len(grid_zs) > max_lines:
+                grid_zs = grid_zs[::max(1, len(grid_zs) // max_lines)]
+
+            xs_mesh, zs_mesh = np.meshgrid(grid_xs, grid_zs)
+            ys_mesh = np.ones_like(xs_mesh) * max_y
+            pts = np.stack([xs_mesh, ys_mesh, zs_mesh], axis=-1)
+            shape0 = pts.shape
+            pts_flat = pts.reshape(-1, 3)
+            pts_t = transform(pts_flat)
+            pts_t[:, -1] = np.clip(pts_t[:, -1], 0.25, None)
+            pts_2d = (K_nv @ pts_t.T).T
+            pts_2d[:, :2] /= pts_2d[:, 2:]
+            pts_2d = pts_2d.reshape(shape0[0], shape0[1], 3)
+
+            # Draw horizontal (const-z) and vertical (const-x) grid lines
+            for r in range(shape0[0] - 1):
+                for c in range(shape0[1] - 1):
+                    # horizontal segment: same row (r), cols c -> c+1
+                    a = pts_2d[r, c]
+                    b = pts_2d[r, c + 1]
+                    if a[2] > 0 and b[2] > 0:
+                        cv2.line(canvas,
+                                 (int(a[0]), int(a[1])),
+                                 (int(b[0]), int(b[1])),
+                                 grid_color, 1, cv2.LINE_AA)
+                    # vertical segment: same col (c), rows r -> r+1
+                    a = pts_2d[r, c]
+                    b = pts_2d[r + 1, c]
+                    if a[2] > 0 and b[2] > 0:
+                        cv2.line(canvas,
+                                 (int(a[0]), int(a[1])),
+                                 (int(b[0]), int(b[1])),
+                                 grid_color, 1, cv2.LINE_AA)
+
+    # --- Cuboids, depth-sorted (far first) ---
+    vis_order = sorted(
+        range(len(vis_insts)),
+        key=lambda i: -vis_insts[i]["corners3d"].mean(0)[2]
+    )
+    font = max(0.5, H / 1000.0)
+    for i in vis_order:
+        inst = vis_insts[i]
+        # pick the ORIGINAL index for color consistency
+        original_idx = inst.get("_idx", i)
+        color = _color_for(original_idx)
+        verts_t = transform(inst["corners3d"])
+        draw_3d_wireframe(canvas, K_nv, verts_t, color, thickness)
+        # Label
+        top_c = verts_t[4]
+        if top_c[-1] > 0:
+            p = (K_nv @ top_c) / top_c[-1]
+            _draw_label(canvas, (p[0], p[1]),
+                        inst.get("label", f"#{original_idx}"),
+                        color, font_scale=font)
+
+    # Small axis marker in lower-left
+    cv2.putText(canvas,
+                f"novel view  pitch={math.degrees(pitch_rad):.0f}°",
+                (12, H - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (90, 90, 90), 2)
     return canvas
 
 
@@ -291,15 +381,14 @@ def draw_bev_panel(instances: List[dict],
 # Instance extraction
 # ---------------------------------------------------------------------
 
-def gt_instances(anns, img_w, img_h):
+def gt_instances(anns):
     out = []
-    for i, ann in enumerate(anns):
+    for ann in anns:
         try:
             x, y, w, h = ann["bbox"]
             d = {"box2d_xyxy": (x, y, x + w, y + h)}
         except Exception:
             continue
-        # 3D corners
         corners3d = None
         if ann.get("valid3D", True) and not ann.get("behind_camera", False):
             try:
@@ -308,12 +397,14 @@ def gt_instances(anns, img_w, img_h):
                 R = np.array(ann["R_cam"], dtype=np.float64)
                 corners3d = cuboid_corners(c, dd, R)
             except Exception:
-                corners3d = None
+                pass
         d["corners3d"] = corners3d
         name = ann.get("category_name", "?")
         tid = ann.get("track_id")
         d["label"] = f"{name}#{tid}" if tid is not None else name
         out.append(d)
+    for i, d in enumerate(out):
+        d["_idx"] = i
     return out
 
 
@@ -331,7 +422,6 @@ def pred_instances(im_obj, top_k, score_min):
             d = {"box2d_xyxy": (x, y, x + w, y + h)}
         except Exception:
             continue
-        # 3D corners: prefer stored bbox3D_cam, else build from center/dims/pose
         corners3d = None
         if inst.get("bbox3D_cam") is not None:
             try:
@@ -354,6 +444,7 @@ def pred_instances(im_obj, top_k, score_min):
         d["corners3d"] = corners3d
         score = float(inst.get("score", 0))
         d["label"] = f"#{i} {score:.2f}"
+        d["_idx"] = i
         out.append(d)
     return out
 
@@ -373,9 +464,11 @@ def main():
     p.add_argument("--score-min", type=float, default=0.0)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--thickness-2d", type=int, default=3)
-    p.add_argument("--thickness-3d", type=int, default=4,
-                   help="Thicker lines for 3D wireframes (paper: 4-6 reads well)")
-    p.add_argument("--bev-size", type=int, default=720)
+    p.add_argument("--thickness-3d", type=int, default=4)
+    p.add_argument("--pitch-deg", type=float, default=60.0,
+                   help="Novel view pitch in degrees (OVMono3D default: 60)")
+    p.add_argument("--novel-size", type=int, default=720,
+                   help="Novel view canvas side length in pixels")
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -391,9 +484,10 @@ def main():
     img_by_id = {im["id"]: im for im in gt["images"]}
     pred_by_img = {im["image_id"]: im for im in preds}
 
-    # Colors for banner bars
     GT_COLOR = (0, 200, 0)
     PRED_COLOR = (0, 0, 220)
+
+    pitch_rad = math.radians(args.pitch_deg)
 
     saved = 0
     for i, img_id in enumerate(sorted(img_by_id.keys())):
@@ -412,63 +506,92 @@ def main():
             continue
         K = np.array(img_info["K"], dtype=np.float64)
         H, W = im_base.shape[:2]
-        font = _font_scale(H)
 
-        gt_insts = gt_instances(ann_by_img.get(img_id, []), W, H)
+        gt_insts = gt_instances(ann_by_img.get(img_id, []))
         pd_insts = pred_instances(pred_by_img.get(img_id), args.top_k,
                                   args.score_min)
 
-        # GT row
-        gt_2d = draw_2d_panel(im_base, gt_insts, font, args.thickness_2d)
-        gt_3d = draw_3d_panel(im_base, gt_insts, K, args.thickness_3d, font)
-        gt_bev = draw_bev_panel(gt_insts, size=(H, args.bev_size))
-        gt_2d = _add_banner(gt_2d, f"GT  2D BOXES  ({len(gt_insts)} GT)", GT_COLOR)
-        gt_3d = _add_banner(gt_3d, f"GT  3D CUBOIDS", GT_COLOR)
-        gt_bev = _add_banner(gt_bev, f"GT  BIRD'S-EYE VIEW", GT_COLOR)
+        # ---- Front-view panels (no dependence on grid flag) ----
+        gt_2d = draw_2d_panel(im_base, gt_insts, args.thickness_2d)
+        gt_3d = draw_3d_front_panel(im_base, gt_insts, K, args.thickness_3d)
+        pd_2d = draw_2d_panel(im_base, pd_insts, args.thickness_2d)
+        pd_3d = draw_3d_front_panel(im_base, pd_insts, K, args.thickness_3d)
 
-        # PRED row
-        pd_2d = draw_2d_panel(im_base, pd_insts, font, args.thickness_2d)
-        pd_3d = draw_3d_panel(im_base, pd_insts, K, args.thickness_3d, font)
-        pd_bev = draw_bev_panel(pd_insts, size=(H, args.bev_size))
-        pd_2d = _add_banner(pd_2d,
-                            f"PRED  2D BOXES  (top {len(pd_insts)})",
-                            PRED_COLOR)
-        pd_3d = _add_banner(pd_3d, f"PRED  3D CUBOIDS", PRED_COLOR)
-        pd_bev = _add_banner(pd_bev, f"PRED  BIRD'S-EYE VIEW", PRED_COLOR)
+        # Make all front panels the same height (they already are).
+        # Novel view is square (args.novel_size × args.novel_size). We pad it
+        # to match the image height for a clean row assembly, or downscale.
+        target_h = H
+        nv_size = min(args.novel_size, target_h)
 
-        # Compose 2 rows. Each row: [2D | 3D | BEV]. All panels must be
-        # the same height (they are, thanks to matching image + banner).
-        def _row(pans):
-            hmax = max(p.shape[0] for p in pans)
-            pans = [
-                np.vstack([p, np.full((hmax - p.shape[0], p.shape[1], 3),
-                                      32, dtype=np.uint8)])
-                if p.shape[0] < hmax else p for p in pans]
-            return np.hstack(pans)
+        def _novel(instances, with_grid):
+            nv = novel_view_panel(K, (H, W), instances, nv_size,
+                                  pitch_rad=pitch_rad, with_grid=with_grid,
+                                  thickness=args.thickness_3d)
+            # Pad to target_h if smaller
+            if nv.shape[0] < target_h:
+                pad = np.full((target_h - nv.shape[0], nv.shape[1], 3), 245,
+                              dtype=np.uint8)
+                nv = np.vstack([nv, pad])
+            elif nv.shape[0] > target_h:
+                nv = cv2.resize(nv, (int(nv.shape[1] * target_h / nv.shape[0]),
+                                     target_h))
+            return nv
 
-        gt_row = _row([gt_2d, gt_3d, gt_bev])
-        pd_row = _row([pd_2d, pd_3d, pd_bev])
+        def _assemble(with_grid):
+            gt_nv = _novel(gt_insts, with_grid)
+            pd_nv = _novel(pd_insts, with_grid)
 
-        # Pad rows to same width if different
-        wmax = max(gt_row.shape[1], pd_row.shape[1])
-        def _pad_w(r):
-            if r.shape[1] == wmax:
-                return r
-            return np.hstack([r, np.full(
-                (r.shape[0], wmax - r.shape[1], 3), 32, dtype=np.uint8)])
-        gt_row = _pad_w(gt_row)
-        pd_row = _pad_w(pd_row)
+            # Banner titles
+            g_label = "with ground grid" if with_grid else "no grid"
+            gt_2d_b = _add_banner(gt_2d,
+                                  f"GT  2D BOXES  ({len(gt_insts)})", GT_COLOR)
+            gt_3d_b = _add_banner(gt_3d, "GT  3D CUBOIDS", GT_COLOR)
+            gt_nv_b = _add_banner(
+                gt_nv, f"GT  NOVEL VIEW  (pitch {args.pitch_deg:.0f}°, {g_label})",
+                GT_COLOR)
+            pd_2d_b = _add_banner(pd_2d,
+                                  f"PRED  2D BOXES  (top {len(pd_insts)})",
+                                  PRED_COLOR)
+            pd_3d_b = _add_banner(pd_3d, "PRED  3D CUBOIDS", PRED_COLOR)
+            pd_nv_b = _add_banner(
+                pd_nv, f"PRED  NOVEL VIEW  ({g_label})",
+                PRED_COLOR)
 
-        grid = np.vstack([gt_row, pd_row])
-        cv2.imwrite(str(args.out / f"img_{img_id:06d}.jpg"), grid)
+            def _row(panels):
+                hmax = max(p.shape[0] for p in panels)
+                panels = [
+                    (np.vstack([p, np.full((hmax - p.shape[0], p.shape[1], 3),
+                                           32, dtype=np.uint8)])
+                     if p.shape[0] < hmax else p)
+                    for p in panels]
+                return np.hstack(panels)
+
+            gt_row = _row([gt_2d_b, gt_3d_b, gt_nv_b])
+            pd_row = _row([pd_2d_b, pd_3d_b, pd_nv_b])
+            wmax = max(gt_row.shape[1], pd_row.shape[1])
+            if gt_row.shape[1] < wmax:
+                gt_row = np.hstack([gt_row, np.full(
+                    (gt_row.shape[0], wmax - gt_row.shape[1], 3), 32, np.uint8)])
+            if pd_row.shape[1] < wmax:
+                pd_row = np.hstack([pd_row, np.full(
+                    (pd_row.shape[0], wmax - pd_row.shape[1], 3), 32, np.uint8)])
+            return np.vstack([gt_row, pd_row])
+
+        img_with = _assemble(with_grid=True)
+        img_no = _assemble(with_grid=False)
+
+        cv2.imwrite(str(args.out / f"img_{img_id:06d}.jpg"), img_with)
+        cv2.imwrite(str(args.out / f"img_{img_id:06d}_nogrid.jpg"), img_no)
         saved += 1
 
-    print(f"\nWrote {saved} samples to {args.out}/")
-    print(f"  Each img_NNNNNN.jpg is a 2x3 grid:")
-    print(f"    row 1: GT      — 2D boxes | 3D cuboids | BEV footprints")
-    print(f"    row 2: PRED    — 2D boxes | 3D cuboids | BEV footprints")
-    print(f"  Per-instance colors are consistent across the three views,")
-    print(f"  so you can track a single animal from 2D -> 3D -> BEV by color.")
+    print(f"\nWrote {saved} samples × 2 files = {saved * 2} images to {args.out}/")
+    print(f"  img_NNNNNN.jpg         — 2x3 grid with ground grid in novel view")
+    print(f"  img_NNNNNN_nogrid.jpg  — same 2x3 grid, novel view without grid")
+    print(f"\nLayout (each file):")
+    print(f"  GT  row:  [2D boxes]  [3D cuboids]  [novel view {args.pitch_deg:.0f}°]")
+    print(f"  PRED row: [2D boxes]  [3D cuboids]  [novel view {args.pitch_deg:.0f}°]")
+    print(f"\nPer-instance colors are consistent across all three panels of a row,")
+    print(f"so you can follow the same animal from 2D → 3D → novel view by color.")
 
 
 if __name__ == "__main__":
