@@ -13,16 +13,31 @@ tools that affect the pipeline. Run this to catch breakage before scaling.
 
 ---
 
-## 0. Setup (copy once at session start)
+## 0. Setup (first terminal — ALWAYS run these before anything else)
 
 ```bash
 ssh node81
 conda activate /storage3/3DOM/vshukla/envs/ovmono3d
 cd /storage2/3DOM/vshukla/repos/ovmono3d
 git pull
-export SMOKE_OUT=output/smoke_$(date +%Y%m%d_%H%M%S)
-mkdir -p "$SMOKE_OUT"
-echo "SMOKE_OUT=$SMOKE_OUT"
+mkdir -p output/smoke
+```
+
+**All steps below write to `output/smoke/...` — a fixed path.** You can open
+as many additional terminals as you want (for parallel zero-shot + training,
+or monitoring) — just `ssh node81 && cd /storage2/3DOM/vshukla/repos/ovmono3d
+&& conda activate /storage3/3DOM/vshukla/envs/ovmono3d` and paste commands
+from this doc. No env-var setup required.
+
+If you want a clean slate (rerun from scratch):
+```bash
+rm -rf output/smoke   # wipe previous smoke outputs
+mkdir -p output/smoke
+```
+
+If you want to keep history across smoke runs, rename before restarting:
+```bash
+mv output/smoke output/smoke_$(date +%Y%m%d_%H%M%S) && mkdir -p output/smoke
 ```
 
 ## 1. Smallest available zip per species (picked for speed)
@@ -92,13 +107,29 @@ print(f'OK: {len(train_v)} train vids, {len(val_v)} val vids, no overlap')
 
 **Abort if any line fails.** Video overlap must be 0.
 
+## 💡 Steps 4 and 5 can run in parallel (different terminals)
+
+Each writes to a **different subdirectory under `output/smoke/`** and the
+zero-shot eval shares the GPU with training very lightly (mostly CPU after
+inference). Do Step 4 in terminal A while Step 5 runs in terminal B.
+
+Open a second terminal:
+```bash
+ssh node81
+conda activate /storage3/3DOM/vshukla/envs/ovmono3d
+cd /storage2/3DOM/vshukla/repos/ovmono3d
+# no env vars to re-export — the doc uses the fixed output/smoke path
+```
+
+Then paste Step 4 in one and Step 5 in the other.
+
 ## 4. Zero-shot eval (~5 min, `--skip-rel-ap3d` because no in-vocab preds)
 
 ```bash
 bash tools/run_full_eval.sh \
     --weights checkpoints/ovmono3d_lift.pth \
     --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     "$SMOKE_OUT/zeroshot" \
+    --out     "output/smoke/zeroshot" \
     --label   "zero-shot smoke" \
     --gt      datasets/Omni3D/WildBox_val.json \
     --skip-rel-ap3d
@@ -122,7 +153,7 @@ python tools/train_net.py \
     SOLVER.WARMUP_ITERS 100 \
     SOLVER.CHECKPOINT_PERIOD 500 \
     TEST.EVAL_PERIOD 10000 \
-    OUTPUT_DIR "$SMOKE_OUT/finetune"
+    OUTPUT_DIR "output/smoke/finetune"
 # Ctrl-b d  to detach, tmux attach -t smoke-train to come back
 ```
 
@@ -136,9 +167,9 @@ AMP instability → rerun with `SOLVER.AMP.ENABLED False`.
 
 ```bash
 bash tools/run_full_eval.sh \
-    --weights "$SMOKE_OUT/finetune/model_final.pth" \
+    --weights "output/smoke/finetune/model_final.pth" \
     --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     "$SMOKE_OUT/finetuned_eval" \
+    --out     "output/smoke/finetuned_eval" \
     --label   "fine-tuned smoke" \
     --gt      datasets/Omni3D/WildBox_val.json
 ```
@@ -151,14 +182,14 @@ populated (if only one class is non-zero, symlink bug recurred).
 
 ```bash
 python tools/make_report.py \
-    --run-dir "$SMOKE_OUT/zeroshot"       --label "zero-shot" \
-    --run-dir "$SMOKE_OUT/finetuned_eval" --label "fine-tuned" \
+    --run-dir "output/smoke/zeroshot"       --label "zero-shot" \
+    --run-dir "output/smoke/finetuned_eval" --label "fine-tuned" \
     --gt      datasets/Omni3D/WildBox_val.json \
     --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     "$SMOKE_OUT/paper_report" \
+    --out     "output/smoke/paper_report" \
     --compare
 
-cat "$SMOKE_OUT/paper_report/report.md"
+cat "output/smoke/paper_report/report.md"
 ```
 
 **Verify:**
@@ -171,22 +202,22 @@ cat "$SMOKE_OUT/paper_report/report.md"
 ```bash
 # Fine-tuned
 python tools/visualize_class_agnostic.py \
-    --preds "$SMOKE_OUT/finetune/inference/iter_final/WildBox_val/instances_predictions.pth" \
+    --preds "output/smoke/finetune/inference/iter_final/WildBox_val/instances_predictions.pth" \
     --gt    datasets/Omni3D/WildBox_val.json \
-    --out   "$SMOKE_OUT/vis_finetuned" \
+    --out   "output/smoke/vis_finetuned" \
     --top-k 5 --every 50 --limit 20
 
 # Zero-shot (useful comparison)
 python tools/visualize_class_agnostic.py \
-    --preds "$SMOKE_OUT/zeroshot/inference/iter_final/WildBox_val/instances_predictions.pth" \
+    --preds "output/smoke/zeroshot/inference/iter_final/WildBox_val/instances_predictions.pth" \
     --gt    datasets/Omni3D/WildBox_val.json \
-    --out   "$SMOKE_OUT/vis_zeroshot" \
+    --out   "output/smoke/vis_zeroshot" \
     --top-k 5 --every 50 --limit 20
 ```
 
 Outputs:
 ```
-$SMOKE_OUT/vis_finetuned/
+output/smoke/vis_finetuned/
     img_NNNNNN.jpg         ← 2×3 grid, novel view WITH ground grid
     img_NNNNNN_nogrid.jpg  ← same layout, novel view WITHOUT grid
 ```
@@ -198,32 +229,32 @@ Each file shows, top-to-bottom:
 ## 9. Training curves (~5 seconds)
 
 ```bash
-python tools/plot_training.py "$SMOKE_OUT/finetune/metrics.json"
-ls "$SMOKE_OUT/finetune/training_curves.png"
+python tools/plot_training.py "output/smoke/finetune/metrics.json"
+ls "output/smoke/finetune/training_curves.png"
 ```
 
 ## 10. Final file inventory
 
 ```bash
-tree -L 2 "$SMOKE_OUT"
+tree -L 2 "output/smoke"
 # or
-find "$SMOKE_OUT" -maxdepth 3 -type f | sort
+find "output/smoke" -maxdepth 3 -type f | sort
 ```
 
 **Must exist:**
-- `$SMOKE_OUT/finetune/model_final.pth`
-- `$SMOKE_OUT/finetune/inference/iter_final/WildBox_val/instances_predictions.pth`
-- `$SMOKE_OUT/finetune/metrics.json`
-- `$SMOKE_OUT/finetune/training_curves.png`
-- `$SMOKE_OUT/zeroshot/summary_nhd.txt`
-- `$SMOKE_OUT/finetuned_eval/summary_nhd.txt`
-- `$SMOKE_OUT/finetuned_eval/bev_ap.json`
-- `$SMOKE_OUT/finetuned_eval/log.txt` (contains all 5 species per-class AP)
-- `$SMOKE_OUT/finetuned_eval/log.rel.txt` (contains Rel-AP3D)
-- `$SMOKE_OUT/paper_report/report.md`
-- `$SMOKE_OUT/paper_report/table_main.tex`
-- `$SMOKE_OUT/vis_finetuned/img_NNNNNN.jpg` × ≥20
-- `$SMOKE_OUT/vis_finetuned/img_NNNNNN_nogrid.jpg` × ≥20
+- `output/smoke/finetune/model_final.pth`
+- `output/smoke/finetune/inference/iter_final/WildBox_val/instances_predictions.pth`
+- `output/smoke/finetune/metrics.json`
+- `output/smoke/finetune/training_curves.png`
+- `output/smoke/zeroshot/summary_nhd.txt`
+- `output/smoke/finetuned_eval/summary_nhd.txt`
+- `output/smoke/finetuned_eval/bev_ap.json`
+- `output/smoke/finetuned_eval/log.txt` (contains all 5 species per-class AP)
+- `output/smoke/finetuned_eval/log.rel.txt` (contains Rel-AP3D)
+- `output/smoke/paper_report/report.md`
+- `output/smoke/paper_report/table_main.tex`
+- `output/smoke/vis_finetuned/img_NNNNNN.jpg` × ≥20
+- `output/smoke/vis_finetuned/img_NNNNNN_nogrid.jpg` × ≥20
 
 ## Timing summary
 
