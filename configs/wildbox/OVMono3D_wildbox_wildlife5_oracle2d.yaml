@@ -1,0 +1,27 @@
+_BASE_: "OVMono3D_wildbox_wildlife5.yaml"
+
+# Paper-protocol zero-shot: use precomputed GroundingDINO 2D boxes as
+# the "oracle" input to the 3D cube head. Produced by
+# tools/precompute_gdino_oracle.py. See WILDBOX_EXPERIMENT.md §6.4.
+TEST:
+  ORACLE2D: True
+
+DATASETS:
+  # Evaluator's class-mode hardcoded lookup path:
+  #   cfg.DATASETS.ORACLE2D_FILES[EVAL_MODE].<mode>.<dataset_name>
+  # Register WildBox_val under both target_aware and previous_metric so
+  # either EVAL_MODE setting works.
+  ORACLE2D_FILES:
+    EVAL_MODE: target_aware
+    target_aware:
+      novel:
+        WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+      base:
+        WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+    previous_metric:
+      novel:
+        WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+      base:
+        WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+
+OUTPUT_DIR: "output/ovmono3d_wildbox_wildlife5_oracle2d"

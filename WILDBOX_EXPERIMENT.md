@@ -490,9 +490,62 @@ MODEL.ROI_CUBE_HEAD:
 - **Class-agnostic 2D AP @ {0.25, 0.50, 0.75}** (zero-shot diagnostic).
 - **NHD scale search** via `class_agnostic_eval.py --nhd`: pytorch3d-free Rel-AP-3D surrogate.
 
-### 6.4 Zero-shot evaluation protocol
+### 6.4 Zero-shot evaluation protocol — IMPORTANT
 
-Pretrained OVMono3D has 50 class slots mapped to Omni3D (indoor/driving). None match wildlife → all primary AP register as 0. The *useful* zero-shot number is **class-agnostic 2D AP**: "did the pretrained RPN localize animals, regardless of class label?" This is reported in the diagnostic subtable (§6.1 caveat).
+There are **two** possible zero-shot protocols for OVMono3D. We currently run the stricter one by default; the paper's Table 1 uses the other one.
+
+#### 6.4.1 The paper's zero-shot protocol (what we should match for Table 1)
+
+OVMono3D paper uses **`TEST.ORACLE2D=True`** with **precomputed GroundingDINO detections** saved at `datasets/Omni3D/gdino_<dataset>_oracle_2d.json`. At eval time:
+
+1. For each val image, look up pre-computed 2D boxes from GroundingDINO (text-prompted per species — "rhino", "elephant", etc.)
+2. These 2D boxes replace the model's own RPN proposals
+3. The model's 3D cube-head lifts these GDino 2D boxes to 3D cuboids
+4. Standard AP is computed on these 3D predictions
+
+This measures: *"given open-vocab 2D localization from GDino (which was never trained on WildBox), how well does OVMono3D's 3D lift onto unseen wildlife classes?"*
+
+#### 6.4.2 What we actually run by default (`TEST.ORACLE2D=False`)
+
+We have `ORACLE2D: False` in [configs/wildbox/OVMono3D_wildbox_finetune.yaml](configs/wildbox/OVMono3D_wildbox_finetune.yaml#L46). This means:
+
+1. 2D boxes come from the **model's own RPN + 2D classifier** (Omni3D-pretrained 50 classes)
+2. No GDino text prompts at test time
+
+For zero-shot, this is **strictly harder** than the paper's protocol because none of the 50 pretrained class slots correspond to wildlife — every 2D-classified prediction is dropped by the evaluator's class filter, giving near-zero standard AP.
+
+**Why we started with this:** the original base config's `ORACLE2D=True` path requires a `gdino_WildBox_val_oracle_2d.json` file, which OVMono3D only ships for the original Omni3D datasets. Setting `ORACLE2D=False` was the unblock-eval path during initial development.
+
+#### 6.4.3 How to run the paper's protocol
+
+To match the paper's zero-shot Table 1 numbers, we need the GDino oracle files for WildBox:
+
+1. **Precompute GDino detections** on `WildBox_val` using [tools/precompute_gdino_oracle.py](tools/precompute_gdino_oracle.py) (CPU mode because our cluster's GDino CUDA build fails — see §3.1). Produces:
+   ```
+   datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+   ```
+2. **Flip the config** — either via a dedicated oracle-enabled config or a CLI override:
+   ```yaml
+   TEST.ORACLE2D: True
+   DATASETS.ORACLE2D_FILES.target_aware.novel.WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+   ```
+
+**Compute cost warning:** GDino on CPU is slow (~5-15 s/image). 13 361 val images × 5 species prompts ≈ **24-36 hours** one-time. Precomputed once, cached as JSON, every subsequent eval reuses it in seconds.
+
+If time-constrained:
+- **Subsample val** to 1 000-2 000 images for GDino precompute. Flag as a caveat.
+- **Rebuild GDino with CUDA** (blocked on our cluster by glibc — could work elsewhere). Reduces to ~1-2 hours.
+- **Docker / Singularity** container with older glibc for GDino only.
+
+#### 6.4.4 Which protocol to report
+
+For a paper following OVMono3D/LabelAny3D convention, **the headline zero-shot column uses `ORACLE2D=True` (GDino-based)**. Our current `ORACLE2D=False` numbers are a *different, stricter* experiment ("closed-vocab RPN transfer") — useful as a supplementary baseline but not the main number.
+
+**Action**: run the GDino precompute, then rerun zero-shot eval with `ORACLE2D=True`. See §21.4 for the task entry.
+
+#### 6.4.5 The useful zero-shot number either way
+
+Class-agnostic 2D AP (via [tools/class_agnostic_eval.py](tools/class_agnostic_eval.py)) is meaningful under **both** protocols — it ignores class labels and measures pure localization transfer. Report it in both conditions as a sanity/consistency check.
 
 ---
 
@@ -754,6 +807,7 @@ Expected: +5-10 3D AP, especially on long-tail.
 | **`configs/wildbox/category_meta.json` symlinked to wildlife5** | new | `train_net.py --eval-only` (line 402) reads this path, not the top-level one. The old Phase-1 giraffe-only file was causing every --eval-only standalone run to report only giraffe |
 | `run_full_eval.sh` auto-syncs both category_meta files | | Prevents the two-files-diverge bug at the source |
 | **`search_rel_scale` switched to per-block IoU computation + progress prints** | `cubercnn/evaluation/omni3d_evaluation.py` | Old flat-list approach built a `box3d_overlap(N_all × M_all)` matrix per scale: for 13k val images that's ~1.6B CPU pair comparisons per scale × 28 scales → never finishes. Per-(img, cat) blocks are orders of magnitude smaller. |
+| **GroundingDINO oracle precompute tool** | new `tools/precompute_gdino_oracle.py` + `configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml` | Matches the OVMono3D paper's zero-shot protocol (`TEST.ORACLE2D=True` with GDino-text-prompted 2D boxes). Our default `ORACLE2D=False` is strictly harder; the paper's Table 1 uses the GDino-based flavor. See §6.4 for the full story. |
 
 ---
 
@@ -1330,6 +1384,42 @@ Cause: `tools/train_net.py` in `--eval-only` mode reads `category_meta.json` fro
 Cause: `search_rel_scale` in [cubercnn/evaluation/omni3d_evaluation.py](cubercnn/evaluation/omni3d_evaluation.py) built ONE giant `box3d_overlap(N_all_preds × M_all_gt)` matrix per scale. For our 13 361-image val set: ~27k preds × ~59k GT = ~1.6B CPU pair comparisons per scale × 28 scales. Effectively never finishes.
 
 **Fix applied (commit pending)**: rewrote `search_rel_scale` to compute IoU **per-(image, category) block** instead of as one giant matrix. Sum of per-block comparisons is orders of magnitude smaller. Also added progress printing (`[rel_ap3d] s=X.XXX score=... elapsed=Ns eta=Ns`) so stuckness is observable in real time.
+
+### 21.3.5 Paper-protocol zero-shot (GDino oracle) — pending
+
+We currently run `TEST.ORACLE2D=False` (model's own RPN), which is stricter than the OVMono3D paper's zero-shot. Matching Table 1 of the paper requires GroundingDINO oracle files. Steps (see §6.4):
+
+1. Verify GDino can run on this cluster (its CUDA kernels failed to build but CPU fallback exists):
+   ```bash
+   python -c "
+   import groundingdino; from groundingdino.models import build_model
+   from groundingdino.util.slconfig import SLConfig
+   print('GDino OK, CPU-only mode is fine for precompute')
+   "
+   ```
+
+2. Precompute GDino oracle JSON (slow — 24-36 hours on CPU for full val):
+   ```bash
+   python tools/precompute_gdino_oracle.py \
+       --gt         datasets/Omni3D/WildBox_val.json \
+       --out        datasets/Omni3D/gdino_WildBox_val_oracle_2d.json \
+       --species    rhino elephant zebra giraffe gazelle \
+       --device     cpu \
+       --limit      0          # 0 = all; set e.g. 500 for a smoke test first
+   ```
+
+3. Rerun zero-shot with the paper-protocol config:
+   ```bash
+   bash tools/run_full_eval.sh \
+       --weights checkpoints/ovmono3d_lift.pth \
+       --config  configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml \
+       --out     output/wildbox_wl5_zeroshot_oracle2d \
+       --label   "zero-shot (paper protocol, GDino oracle)" \
+       --gt      datasets/Omni3D/WildBox_val.json \
+       --skip-rel-ap3d
+   ```
+
+4. Include in the comparison report as a separate row alongside current `ORACLE2D=False` numbers.
 
 ### 21.4 Remaining work (do next)
 
