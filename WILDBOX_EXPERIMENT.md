@@ -2,6 +2,8 @@
 
 **Purpose of this document.** Self-contained reference for reproducing WildBox 3D wildlife detection. Covers dataset, preprocessing, training, evaluation, and adaptation to other 3D detection architectures. Written for (1) researchers replicating on Cube R-CNN / DetAny3D / custom architectures, (2) paper-writing.
 
+**Related doc:** [QUICK_START_SMOKE_TEST.md](QUICK_START_SMOKE_TEST.md) — a ~2-hour end-to-end sanity test with one zip per species + 2000 training iters. Run this after pulling new code or changing configs, before committing to a multi-hour full run.
+
 ---
 
 ## 1. TL;DR
