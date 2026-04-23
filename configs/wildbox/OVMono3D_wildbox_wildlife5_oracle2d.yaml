@@ -5,6 +5,15 @@ _BASE_: "OVMono3D_wildbox_wildlife5.yaml"
 # tools/precompute_gdino_oracle.py. See WILDBOX_EXPERIMENT.md §6.4.
 TEST:
   ORACLE2D: True
+  # Extend Rel-AP3D scale search range for zero-shot. Fine-tuned runs
+  # produce predictions already in WildBox's VGGT-synthetic scale
+  # (best-scale ≈ 1.0), so the base config uses (0.3, 3.0, 28). Zero-shot
+  # predictions from an Omni3D-metric-pretrained cube head need to be
+  # down-scaled much more aggressively (observed best-scale ≈ 0.1–0.3)
+  # to align with WildBox's median-|Z|=1 normalization. A search range
+  # that doesn't cover 0.1 leaves Rel-AP3D pinned to its boundary and
+  # understates the recoverable 3D performance.
+  REL_AP3D_SEARCH: [0.05, 3.0, 32]
 
 DATASETS:
   # Evaluator's class-mode hardcoded lookup path:
