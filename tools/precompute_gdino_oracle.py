@@ -118,7 +118,7 @@ def preprocess_image(img_path: Path, device: str):
 
 def run_one(model, image_tensor, text_prompt: str,
             box_threshold: float, text_threshold: float,
-            device: str):
+            device: str, fp16: bool = False):
     """One forward pass producing (boxes [N,4] cxcywh-normalized,
     logits [N, num_tokens]). Ports groundingdino.util.inference.predict
     inline to avoid its file-only input path."""
@@ -129,8 +129,13 @@ def run_one(model, image_tensor, text_prompt: str,
 
     # inference_mode is stricter than no_grad: it also bypasses
     # torch.utils.checkpoint's recomputation path entirely.
+    # autocast handles mixed-dtype internals (Swin rel-pos bias is fp32) cleanly.
     with torch.inference_mode():
-        outputs = model(image_tensor.unsqueeze(0), captions=[prompt])
+        if fp16 and device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = model(image_tensor.unsqueeze(0), captions=[prompt])
+        else:
+            outputs = model(image_tensor.unsqueeze(0), captions=[prompt])
 
     logits = outputs["pred_logits"].cpu().sigmoid()[0]  # (N, n_tokens)
     boxes = outputs["pred_boxes"].cpu()[0]              # (N, 4) cxcywh norm
@@ -232,10 +237,11 @@ def main():
     # Load model
     logger.info(f"Loading GroundingDINO on device={args.device} fp16={args.fp16}")
     model = load_gdino(args.config, args.checkpoint, args.device)
-    if args.fp16:
-        if args.device != "cuda":
-            sys.exit("--fp16 requires --device cuda")
-        model = model.half()
+    if args.fp16 and args.device != "cuda":
+        sys.exit("--fp16 requires --device cuda")
+    # NOTE: don't call model.half() globally. The Swin backbone has
+    # fp32-only buffers (relative position bias, attn_mask) that break
+    # under `.half()`. Use torch.autocast around the forward instead.
 
     # Build the tokenizer we need for per-category token spans
     from groundingdino.util.get_tokenlizer import get_tokenlizer
@@ -278,8 +284,6 @@ def main():
 
         try:
             image_tensor, (H0, W0) = preprocess_image(img_path, args.device)
-            if args.fp16:
-                image_tensor = image_tensor.half()
         except Exception as e:
             logger.warning(f"Failed to load {img_path}: {e}")
             out_rows.append({
@@ -293,7 +297,7 @@ def main():
         boxes_n, logits = run_one(model, image_tensor, caption,
                                   box_threshold=args.box_threshold,
                                   text_threshold=args.text_threshold,
-                                  device=args.device)
+                                  device=args.device, fp16=args.fp16)
 
         instances = []
         if boxes_n.numel() > 0:
