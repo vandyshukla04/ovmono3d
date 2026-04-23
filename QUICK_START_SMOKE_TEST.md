@@ -123,7 +123,9 @@ cd /storage2/3DOM/vshukla/repos/ovmono3d
 
 Then paste Step 4 in one and Step 5 in the other.
 
-## 4. Zero-shot eval (~5 min, `--skip-rel-ap3d` because no in-vocab preds)
+## 4. Zero-shot eval — closed-vocab RPN (ORACLE2D=False, ~5 min)
+
+This is the **stricter** zero-shot baseline: model's own RPN + 2D classifier, no open-vocab help. Fast to run, useful as a supplementary number but not the one the OVMono3D paper reports.
 
 ```bash
 bash tools/run_full_eval.sh \
@@ -138,6 +140,58 @@ bash tools/run_full_eval.sh \
 **Expected:** near-zero standard AP (closed-vocab pretraining has no
 wildlife classes). Class-agnostic 2D AP in `summary_nhd.txt` should show
 `AP@0.50` in the range 5–25 (proves the RPN transfers).
+
+## 4.5 [Optional] Paper-protocol zero-shot with GDino oracle (~10 min + one-time ~2.5 h precompute)
+
+Matches the OVMono3D paper's zero-shot: GroundingDINO text-prompted 2D boxes replace the RPN. Run this if you want the headline zero-shot comparison that's directly comparable to the paper's Table 1 — and to any other architecture evaluated under the same protocol (see [WILDBOX_EXPERIMENT.md §20.6](WILDBOX_EXPERIMENT.md)).
+
+**One-time cost:** precomputing the GDino oracle JSON for 13 k val images takes ~2.5 h on A40. Skip this step on the first smoke if you just want the pipeline to green up fast; come back after you've invested the one-time cost.
+
+```bash
+# (a) One-time install of the correct GDino package — SEE WILDBOX_EXPERIMENT.md §3.1 FIRST.
+#     Do NOT use the github clone or groundingdino==0.1.0. Must be groundingdino-py.
+pip install --no-cache-dir groundingdino-py==0.4.0
+
+# (b) One-time GDino checkpoint download (~1 GB)
+mkdir -p checkpoints
+test -f checkpoints/groundingdino_swinb_cogcoor.pth || \
+  wget -O checkpoints/groundingdino_swinb_cogcoor.pth \
+    https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
+
+# (c) Smoke — 3 images, should take < 30 s
+python tools/precompute_gdino_oracle.py \
+    --gt       datasets/Omni3D/WildBox_val.json \
+    --out      /tmp/smoke_3.json \
+    --species  rhino elephant zebra giraffe gazelle \
+    --device   cuda \
+    --box-threshold 0.15 --text-threshold 0.10 \
+    --limit    3
+# If per-img > 5 s/img: wrong GDino package installed. Re-check step (a).
+
+# (d) Full precompute (~2.5 h on A40) — one-time, output is reusable forever
+mkdir -p logs
+nohup python tools/precompute_gdino_oracle.py \
+    --gt       datasets/Omni3D/WildBox_val.json \
+    --out      datasets/Omni3D/gdino_WildBox_val_oracle_2d.json \
+    --species  rhino elephant zebra giraffe gazelle \
+    --device   cuda \
+    --box-threshold 0.15 --text-threshold 0.10 \
+    --log-every 100 \
+    > logs/gdino_oracle.log 2>&1 &
+disown
+# tail -f logs/gdino_oracle.log
+
+# (e) Paper-protocol zero-shot eval — reads the oracle JSON from (d)
+bash tools/run_full_eval.sh \
+    --weights checkpoints/ovmono3d_lift.pth \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml \
+    --out     "output/smoke/zeroshot_oracle2d" \
+    --label   "zero-shot (paper protocol)" \
+    --gt      datasets/Omni3D/WildBox_val.json \
+    --skip-rel-ap3d
+```
+
+**Two-row report:** after running both step 4 (`ORACLE2D=False`) and step 4.5 (`ORACLE2D=True`), the make_report command in step 7 can include both as separate rows — see §20.6 for why this is the right way to present the comparison.
 
 ## 5. Short fine-tune (~1 hour, 2000 iters)
 
@@ -262,11 +316,15 @@ find "output/smoke" -maxdepth 3 -type f | sort
 |---|---:|
 | 2 — prep (first run, includes extractions) | 10–20 min |
 | 2 — prep (cached) | <1 min |
-| 4 — zero-shot eval | ~5 min |
+| 4 — zero-shot eval (`ORACLE2D=False`) | ~5 min |
+| 4.5 — paper-protocol zero-shot precompute (one-time) | ~2.5 h |
+| 4.5 — paper-protocol zero-shot eval (after precompute exists) | ~10 min |
 | 5 — short fine-tune (2000 iters) | ~55 min |
 | 6 — fine-tuned eval + Rel-AP3D | ~20 min |
 | 7-9 — report + vis + plots | ~2 min |
-| **Total** | **~1h 40m** (cached prep), **~2h** (first run) |
+| **Total (skipping 4.5)** | **~1h 40m** (cached prep), **~2h** (first run) |
+| **Total (first time, incl. 4.5 precompute)** | **~4h 10m** |
+| **Total (4.5 eval only, precompute reused)** | **~1h 50m** |
 
 ---
 
@@ -290,7 +348,8 @@ and [§21](WILDBOX_EXPERIMENT.md) for the current-state / resume context.
 - SAM3 tight 2D bbox pipeline ✓
 - Video-level splits with deterministic seed ✓
 - Category-meta consistency (both symlinks + stats.json) ✓
-- Zero-shot pipeline + class-agnostic eval ✓
+- Zero-shot pipeline — closed-vocab RPN (`ORACLE2D=False`) + class-agnostic eval ✓
+- Zero-shot pipeline — paper protocol (GDino oracle, `ORACLE2D=True`), if step 4.5 run ✓
 - Training loop + AMP + RepeatFactorSampler ✓
 - Standard eval (2D AP, 3D AP) with correct per-class mapping ✓
 - Rel-AP3D per-block scale search ✓

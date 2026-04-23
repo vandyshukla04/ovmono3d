@@ -256,7 +256,7 @@ pip install shapely openpyxl   # BEV IoU + xlsx readers
 ### 3.1 Known environment issues
 
 - **pytorch3d CUDA build failure on CUDA 12.x with newer glibc.** The cluster's glibc rejects CUDA's `cospi`/`sinpi` declarations. Workaround already in the code: the Rel-AP3D scale search forces CPU tensors (see `cubercnn/evaluation/omni3d_evaluation.py:search_rel_scale`). CPU `box3d_overlap` works on our pinned commit (055ab3a). Don't try to force `FORCE_CUDA=1` unless you're on a cluster with compatible glibc.
-- **GroundingDINO CUDA build also fails** on this cluster. The package is marked optional in `setup.sh`. WildBox config uses `TEST.ORACLE2D=False` so the model's own RPN handles 2D — GroundingDINO isn't called. Safe to skip.
+- **GroundingDINO CUDA build also fails** on this cluster (same cospi/sinpi glibc mismatch). **Use `pip install groundingdino-py==0.4.0`** — the PyPI package has a proper GPU Python fallback (~0.7 s/img on A40). Do **not** use the official `IDEA-Research/GroundingDINO` GitHub clone directly (its `ms_deform_attn.py` crashes with `NameError: name '_C' is not defined` when the CUDA op can't load — no fallback). Do **not** use `pip install groundingdino==0.1.0` either — that version's fallback runs on **CPU** (~41 s/img), 60× slower than `groundingdino-py`. See §6.4.3 for the precompute command.
 - **`libGL.so.1: cannot open shared object file`** — appears on CPU-only nodes because `cv2` requires system graphics libs. Run eval on GPU nodes only.
 
 ---
@@ -518,24 +518,100 @@ For zero-shot, this is **strictly harder** than the paper's protocol because non
 
 #### 6.4.3 How to run the paper's protocol
 
-To match the paper's zero-shot Table 1 numbers, we need the GDino oracle files for WildBox:
+To match the paper's zero-shot Table 1 numbers, we need the GDino oracle files for WildBox. **Runtime for the full 13 361 val images is ~2.5 h on A40** once the right GDino package is installed.
 
-1. **Precompute GDino detections** on `WildBox_val` using [tools/precompute_gdino_oracle.py](tools/precompute_gdino_oracle.py) (CPU mode because our cluster's GDino CUDA build fails — see §3.1). Produces:
-   ```
-   datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
-   ```
-2. **Flip the config** — either via a dedicated oracle-enabled config or a CLI override:
-   ```yaml
-   TEST.ORACLE2D: True
-   DATASETS.ORACLE2D_FILES.target_aware.novel.WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
-   ```
+**Step 1 — install the correct GDino package.** This is the #1 gotcha and the one you must get right:
 
-**Compute cost warning:** GDino on CPU is slow (~5-15 s/image). 13 361 val images × 5 species prompts ≈ **24-36 hours** one-time. Precomputed once, cached as JSON, every subsequent eval reuses it in seconds.
+```bash
+pip uninstall -y groundingdino groundingdino-py       # wipe any prior install
+pip install --no-cache-dir groundingdino-py==0.4.0    # PyPI — proper GPU fallback
+```
 
-If time-constrained:
-- **Subsample val** to 1 000-2 000 images for GDino precompute. Flag as a caveat.
-- **Rebuild GDino with CUDA** (blocked on our cluster by glibc — could work elsewhere). Reduces to ~1-2 hours.
-- **Docker / Singularity** container with older glibc for GDino only.
+`groundingdino-py` is the maintained PyPI fork whose `ms_deform_attn.py` has a **GPU Python fallback** that runs `F.grid_sample` on CUDA tensors when the custom C++ op can't load. Measured on A40: **~0.7 s/image** steady-state, batch=1. See §3.1 for the alternatives (github clone, `groundingdino==0.1.0`) and why they don't work.
+
+**Step 2 — download the GDino SwinB checkpoint** (if not already present):
+
+```bash
+mkdir -p checkpoints
+wget -O checkpoints/groundingdino_swinb_cogcoor.pth \
+  https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
+# Config (if not already in the repo):
+test -f configs/GroundingDINO_SwinB_cfg.py || \
+  wget -O configs/GroundingDINO_SwinB_cfg.py \
+  https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinB_cfg.py
+```
+
+**Step 3 — smoke-test on 3 images first** (should take ~5 s after BERT warmup):
+
+```bash
+python tools/precompute_gdino_oracle.py \
+    --gt       datasets/Omni3D/WildBox_val.json \
+    --out      /tmp/smoke_3.json \
+    --species  rhino elephant zebra giraffe gazelle \
+    --device   cuda \
+    --box-threshold 0.15 --text-threshold 0.10 \
+    --limit    3
+```
+
+The smoke should log `per-img=0.7-1.0s` and produce non-zero `kept=N` boxes. If `per-img > 5 s/img`, you're on the `groundingdino==0.1.0` CPU-fallback path — re-check step 1.
+
+**Step 4 — launch the full run in the background** (~2.5 h):
+
+```bash
+mkdir -p logs
+nohup python tools/precompute_gdino_oracle.py \
+    --gt       datasets/Omni3D/WildBox_val.json \
+    --out      datasets/Omni3D/gdino_WildBox_val_oracle_2d.json \
+    --species  rhino elephant zebra giraffe gazelle \
+    --device   cuda \
+    --box-threshold 0.15 --text-threshold 0.10 \
+    --log-every 100 \
+    > logs/gdino_oracle.log 2>&1 &
+disown
+tail -f logs/gdino_oracle.log       # Ctrl-C to detach; job keeps running
+```
+
+**Step 5 — run paper-protocol zero-shot eval** (uses the precomputed oracle JSON):
+
+```bash
+bash tools/run_full_eval.sh \
+    --weights checkpoints/ovmono3d_lift.pth \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml \
+    --out     output/wildbox_wl5_zeroshot_oracle2d \
+    --label   "zero-shot (paper protocol, GDino oracle)" \
+    --gt      datasets/Omni3D/WildBox_val.json \
+    --skip-rel-ap3d
+```
+
+The oracle JSON is reusable — precompute once, every subsequent zero-shot eval reads it in seconds.
+
+**Threshold tuning (why 0.15/0.10 and not GDino's default 0.25/0.25).** Drone wildlife is small and distant; GDino's web-imagery-tuned defaults suppress most animals at altitude. 0.15 box / 0.10 text keeps noisy detections that the 3D cube head can still refine. If the full run comes back with <1 box per image on average, drop to 0.10/0.05 and re-run; if recall looks fine, stay at 0.15/0.10 for paper consistency.
+
+**Oracle JSON schema** (produced by `tools/precompute_gdino_oracle.py`, consumed by the evaluator via `DATASETS.ORACLE2D_FILES`):
+
+```jsonc
+// datasets/Omni3D/gdino_WildBox_val_oracle_2d.json — one entry per image
+[
+  {
+    "image_id": <int>,                          // matches GT JSON
+    "K": [[...3x3 intrinsics...]],              // copied from GT
+    "file_path": "...",                         // copied from GT
+    "height": H, "width": W,
+    "instances": [
+      {
+        "bbox": [x, y, w, h],                   // xywh in pixels
+        "score": <float>,                       // GDino confidence
+        "category_id": <dataset_id>,            // e.g., 1004 for rhino
+        "category_name": "rhino"
+      },
+      ...
+    ]
+  },
+  ...
+]
+```
+
+This format is **architecture-agnostic** — see §20.6 for how to reuse it with other models.
 
 #### 6.4.4 Which protocol to report
 
@@ -1344,6 +1420,7 @@ The report will be a side-by-side table across architectures. Paper-ready.
 - `configs/category_meta.json` symlink target
 - Evaluation protocol (same `run_full_eval.sh` command, same metrics)
 - Image resolution
+- **Zero-shot 2D detector** — use the same `gdino_WildBox_val_oracle_2d.json` across every architecture (see §20.6). Otherwise zero-shot numbers aren't comparable.
 
 Do vary (and track in §19's template):
 
@@ -1351,6 +1428,62 @@ Do vary (and track in §19's template):
 - Loss weights (as required by the architecture)
 - Backbone pretraining source
 - LR schedule (fit to the architecture)
+
+### 20.6 Paper-protocol zero-shot across architectures (the portable contract)
+
+The OVMono3D paper reports zero-shot 3D by pairing **one open-vocab 2D detector (GroundingDINO)** with each method's 3D head. For cross-architecture comparison, this is the single most important thing to hold fixed. The interchange format is simple: precompute GDino boxes once, hand the resulting JSON to every architecture.
+
+**What "paper protocol zero-shot" means concretely:**
+
+1. Take a pretrained (Omni3D-trained, **not** WildBox-finetuned) checkpoint of architecture X.
+2. At eval time, **replace X's 2D proposals with GDino's text-prompted detections** for the WildBox species.
+3. Let X's 3D head lift those 2D boxes to 3D.
+4. Score with our standard eval stack (2D AP, 3D AP, Rel-AP3D, BEV AP, NHD).
+
+This measures *"how well does X's 3D lift onto an unseen visual domain, given that open-vocab 2D localization is solved for us?"* — the exact question the paper asks.
+
+**Interchange JSON** — produce once via [tools/precompute_gdino_oracle.py](tools/precompute_gdino_oracle.py) (§6.4.3). Every architecture consumes the same file:
+
+```
+datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+```
+
+Schema is in §6.4.3 — one list entry per image with `image_id`, `K`, `file_path`, `height`, `width`, and a list of `instances` (2D xywh box, score, dataset-space `category_id`, `category_name`). No 3D info.
+
+**How each architecture should consume it at eval time.** Wire a hook in the architecture's test-time inference that, for each image:
+
+- **Instead of** running the architecture's own 2D stage (RPN, anchor head, DETR queries, whatever), **load the oracle boxes for that `image_id`**.
+- Map `category_id` from dataset-space to the architecture's contiguous-id space (same mapping you use during training — see §2.8).
+- Feed the loaded boxes into the architecture's 3D head / ROI pool / cuboid regressor.
+
+In OVMono3D (Cube R-CNN variant) this is already a built-in flag: `TEST.ORACLE2D=True` + `DATASETS.ORACLE2D_FILES` — see [configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml](configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml). For a different architecture you may need to add a few lines to its eval loop that load the JSON, rescale boxes to the architecture's preprocessing resolution, and hand them to whatever module normally receives 2D proposals.
+
+**Reporting table for cross-arch zero-shot comparison.** Every row uses the same oracle file:
+
+| Arch | Backbone | 3D head type | 2D source | AP_BEV | Rel-AP3D | NHD |
+|---|---|---|---|---:|---:|---:|
+| OVMono3D (ours) | DINOv2 ViT-B/14 | Cube R-CNN | GDino oracle | ... | ... | ... |
+| Cube R-CNN | ResNet-50 | Cube R-CNN | GDino oracle | ... | ... | ... |
+| DetAny3D | ? | DINO-decoder | GDino oracle | ... | ... | ... |
+
+**Corresponding fine-tuned comparison** (the complementary half of the paper story) uses each architecture's own 2D stage, no oracle — because at this point the 2D head is no longer the limitation; the architecture has seen WildBox:
+
+| Arch | Backbone | 3D head type | 2D source | AP_BEV | Rel-AP3D | NHD |
+|---|---|---|---|---:|---:|---:|
+| OVMono3D (ours) | DINOv2 ViT-B/14 | Cube R-CNN | *own RPN* (finetuned) | ... | ... | ... |
+| Cube R-CNN | ResNet-50 | Cube R-CNN | *own RPN* (finetuned) | ... | ... | ... |
+
+**Additional report column — `ORACLE2D=False` zero-shot (closed-vocab RPN transfer).** Our repo defaults to this stricter baseline (see §6.4.2) because it doesn't require the GDino oracle. Keep it in the paper supplement as an *extra* zero-shot row — measures whether the pretrained RPN alone generalizes to wildlife, with no open-vocab help. Class-agnostic 2D AP here is the most honest number; standard AP is near-zero because pretraining's class slots don't overlap with WildBox.
+
+**Checklist for adding architecture X to the comparison:**
+
+1. Run the GDino precompute (§6.4.3) exactly once — output goes to `datasets/Omni3D/gdino_WildBox_val_oracle_2d.json`. Every downstream arch reads this file; do **not** re-precompute per architecture.
+2. Implement the "load oracle boxes instead of RPN proposals" hook in X's eval loop (the amount of code depends on X — for DETR-style it may be a 10-line replacement of the decoder's query input; for two-stage it's replacing the RPN proposal list).
+3. Confirm X's contiguous-id mapping matches ours ({giraffe:0, zebra:1, elephant:2, rhino:3, gazelle:4} — sorted by dataset-id ascending per §2.8.1).
+4. Run zero-shot eval → produce `instances_predictions.pth` in the schema from §20.3.
+5. Point our `tools/bev_ap_eval.py`, `tools/class_agnostic_eval.py`, `tools/make_report.py` at X's prediction file. Report row appears alongside ours automatically via `--compare`.
+
+That's the whole contract. If X's zero-shot row is much worse than ours and it's **not** using the oracle, the gap is confounded — X's own 2D stage may just be weaker than GDino on this domain. Paper claims about the 3D head need oracle input on both sides.
 
 ---
 
@@ -1385,41 +1518,31 @@ Cause: `search_rel_scale` in [cubercnn/evaluation/omni3d_evaluation.py](cubercnn
 
 **Fix applied (commit pending)**: rewrote `search_rel_scale` to compute IoU **per-(image, category) block** instead of as one giant matrix. Sum of per-block comparisons is orders of magnitude smaller. Also added progress printing (`[rel_ap3d] s=X.XXX score=... elapsed=Ns eta=Ns`) so stuckness is observable in real time.
 
-### 21.3.5 Paper-protocol zero-shot (GDino oracle) — pending
+### 21.3.5 Paper-protocol zero-shot (GDino oracle) — in progress
 
-We currently run `TEST.ORACLE2D=False` (model's own RPN), which is stricter than the OVMono3D paper's zero-shot. Matching Table 1 of the paper requires GroundingDINO oracle files. Steps (see §6.4):
+We currently run `TEST.ORACLE2D=False` (model's own RPN), which is stricter than the OVMono3D paper's zero-shot. Matching Table 1 of the paper requires GroundingDINO oracle files.
 
-1. Verify GDino can run on this cluster (its CUDA kernels failed to build but CPU fallback exists):
-   ```bash
-   python -c "
-   import groundingdino; from groundingdino.models import build_model
-   from groundingdino.util.slconfig import SLConfig
-   print('GDino OK, CPU-only mode is fine for precompute')
-   "
-   ```
+**Status as of 2026-04-23:** the precompute command is launched on node81 and running overnight; expected done in ~2.5 h. Setup worked on `groundingdino-py==0.4.0` (PyPI) at ~0.7 s/img on A40.
 
-2. Precompute GDino oracle JSON (slow — 24-36 hours on CPU for full val):
-   ```bash
-   python tools/precompute_gdino_oracle.py \
-       --gt         datasets/Omni3D/WildBox_val.json \
-       --out        datasets/Omni3D/gdino_WildBox_val_oracle_2d.json \
-       --species    rhino elephant zebra giraffe gazelle \
-       --device     cpu \
-       --limit      0          # 0 = all; set e.g. 500 for a smoke test first
-   ```
+See §6.4.3 for the full protocol (install package → download checkpoint → smoke → full precompute → oracle eval). What to run once the oracle JSON lands:
 
-3. Rerun zero-shot with the paper-protocol config:
-   ```bash
-   bash tools/run_full_eval.sh \
-       --weights checkpoints/ovmono3d_lift.pth \
-       --config  configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml \
-       --out     output/wildbox_wl5_zeroshot_oracle2d \
-       --label   "zero-shot (paper protocol, GDino oracle)" \
-       --gt      datasets/Omni3D/WildBox_val.json \
-       --skip-rel-ap3d
-   ```
+```bash
+bash tools/run_full_eval.sh \
+    --weights checkpoints/ovmono3d_lift.pth \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml \
+    --out     output/wildbox_wl5_zeroshot_oracle2d \
+    --label   "zero-shot (paper protocol, GDino oracle)" \
+    --gt      datasets/Omni3D/WildBox_val.json \
+    --skip-rel-ap3d
+```
 
-4. Include in the comparison report as a separate row alongside current `ORACLE2D=False` numbers.
+Then include this row in the comparison report alongside the existing `ORACLE2D=False` zero-shot and the fine-tuned rows (see §20.6 for the full 3-row table format: `ORACLE2D=False` zero-shot + GDino-oracle zero-shot + fine-tuned).
+
+**Key setup lessons (for the next person, and anyone porting to a new cluster):**
+
+- **Use `pip install groundingdino-py==0.4.0`** — not the github clone (no Python fallback → crashes), not `groundingdino==0.1.0` (CPU-only fallback → 41 s/img, 60× slower). This one detail cost us ~2 hours of CUDA-build debugging this session. §3.1 now calls this out prominently.
+- **Thresholds are domain-specific.** Drone wildlife needs 0.15/0.10 (not GDino's default 0.25/0.25). See §6.4.3 for the reasoning.
+- **Don't chase the CUDA rebuild.** CUDA 12.2+ on this cluster's glibc has an unfixable `cospi`/`sinpi` `noexcept` mismatch. `groundingdino-py`'s Python GPU fallback is within ~10× of the compiled op and perfectly adequate for a one-time 13 k precompute.
 
 ### 21.4 Remaining work (do next)
 

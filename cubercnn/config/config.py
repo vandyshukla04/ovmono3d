@@ -51,10 +51,11 @@ def get_cfg_defaults(cfg):
         # Oracle 2D file for the Novel class dataset
         novel_datasets = {
             'SUNRGBD_test_novel': 'sunrgbd',
-            'ARKitScenes_test_novel': 'arkitscenes', 
-            'KITTI_test_novel': 'kitti'
+            'ARKitScenes_test_novel': 'arkitscenes',
+            'KITTI_test_novel': 'kitti',
+            'WildBox_val': 'WildBox_val',
         }
-        
+
         # Oracle 2D file for the Base class dataset
         base_datasets = {
             'SUNRGBD_test': 'sunrgbd',
@@ -62,7 +63,8 @@ def get_cfg_defaults(cfg):
             'ARKitScenes_test': 'arkitscenes',
             'Objectron_test': 'objectron',
             'KITTI_test': 'kitti',
-            'nuScenes_test': 'nuscenes'
+            'nuScenes_test': 'nuscenes',
+            'WildBox_val': 'WildBox_val',
         }
 
         # Set the file path for the novel class
