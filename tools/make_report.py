@@ -47,8 +47,15 @@ def parse_standard_eval_log(log_path: Path) -> Dict[str, Any]:
 
     Returns a dict keyed by metric mode ('2D', '3D', '3D-Rel') with nested
     dicts: {metric_name: value}. Also parses per-class AP tables.
+
+    Rel-AP3D output lives in `log.rel.txt` (emitted by run_full_eval.sh's
+    step [2/4]), not the main log.txt. We concatenate both so the regex
+    search covers `mode=3D-Rel` blocks that the Rel-AP3D pass produces.
     """
     text = log_path.read_text(errors="ignore") if log_path.exists() else ""
+    rel_log = log_path.parent / "log.rel.txt"
+    if rel_log.exists():
+        text = text + "\n" + rel_log.read_text(errors="ignore")
     result: Dict[str, Any] = {"2D": {}, "3D": {}, "3D-Rel": {},
                               "per_class": {"2D": {}, "3D": {}},
                               "disentangled_nhd": {},
