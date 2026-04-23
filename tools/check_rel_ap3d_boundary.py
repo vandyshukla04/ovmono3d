@@ -217,15 +217,27 @@ def main():
 
     if args.narrow is not None:
         narrow_best, _ = sweep(*args.narrow, "NARROW (config default)")
-        delta = abs(wide_best - narrow_best) / max(abs(wide_best), 1e-9)
+        wide_step = (args.wide[1] - args.wide[0]) / (args.wide[2] - 1)
+        narrow_step = (args.narrow[1] - args.narrow[0]) / (args.narrow[2] - 1)
+        abs_delta = abs(wide_best - narrow_best)
+        rel_delta = abs_delta / max(abs(wide_best), 1e-9)
+        # Quantization-aware: if the two bests differ by less than the
+        # coarser grid's step size, they're sampling the same peak at
+        # different resolutions. Only flag SHIFTED if the absolute delta
+        # exceeds what grid spacing can explain.
+        max_step = max(wide_step, narrow_step)
         print(f"\n=== Boundary verdict ===")
-        print(f"  wide grid best:    {wide_best:.4f}")
-        print(f"  narrow grid best:  {narrow_best:.4f}")
-        print(f"  relative diff:     {100*delta:.1f}%")
-        if delta < 0.05:
-            print("  --> STABLE. Narrow grid is not distorting Rel-AP3D numbers.")
+        print(f"  wide grid best:    {wide_best:.4f}  (grid step {wide_step:.4f})")
+        print(f"  narrow grid best:  {narrow_best:.4f}  (grid step {narrow_step:.4f})")
+        print(f"  abs diff:          {abs_delta:.4f}")
+        print(f"  rel diff:          {100*rel_delta:.1f}%")
+        print(f"  max grid step:     {max_step:.4f}")
+        if abs_delta <= max_step * 1.1:  # 10% slack
+            print("  --> STABLE. Difference is within grid-quantization noise; "
+                  "both grids find the same peak. Narrow grid is adequate.")
         else:
-            print("  --> SHIFTED >5%. Narrow grid under-reports; widen the config.")
+            print("  --> SHIFTED beyond grid quantization. "
+                  "True optimum may lie outside the narrow grid; widen the config.")
 
 
 if __name__ == "__main__":
