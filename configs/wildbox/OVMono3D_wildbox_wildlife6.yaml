@@ -1,0 +1,28 @@
+_BASE_: "OVMono3D_wildbox_finetune.yaml"
+DATASETS:
+  CATEGORY_NAMES: ('rhino', 'elephant', 'plains_zebra', 'grevys_zebra', 'giraffe', 'gazelle')
+  CATEGORY_NAMES_NOVEL: ('rhino', 'elephant', 'plains_zebra', 'grevys_zebra', 'giraffe', 'gazelle')
+  CATEGORY_NAMES_BASE: ('rhino', 'elephant', 'plains_zebra', 'grevys_zebra', 'giraffe', 'gazelle')
+DATALOADER:
+  # Reviewer #6: bump REPEAT_THRESHOLD from 0.25 -> 0.5 to more
+  # aggressively upsample rare-class images (giraffe 2 zips, gazelle 1
+  # zip, grevys_zebra 1 zip). Expected to improve the rare-class
+  # 3D AP cells without hurting elephant/rhino.
+  REPEAT_THRESHOLD: 0.5
+  NUM_WORKERS: 8
+SOLVER:
+  # Batch 8 + LR 2e-3 matches the multi-seed protocol (faster per-iter
+  # than the 20k-iter batch-4 base config and at the same effective LR).
+  IMS_PER_BATCH: 8
+  BASE_LR: 0.002
+  MAX_ITER: 10000
+  STEPS: (6000, 9000)
+  WARMUP_ITERS: 500
+  CHECKPOINT_PERIOD: 5000
+  AMP:
+    ENABLED: True
+TEST:
+  EVAL_PERIOD: 10000
+  EVAL_REL_AP3D: False
+  REL_AP3D_SEARCH: [0.05, 3.0, 32]   # widen in case zero-shot scale is needed in future
+OUTPUT_DIR: "output/ovmono3d_wildbox_wildlife6"
