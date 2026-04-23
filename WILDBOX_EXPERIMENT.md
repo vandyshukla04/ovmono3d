@@ -587,6 +587,8 @@ The oracle JSON is reusable — precompute once, every subsequent zero-shot eval
 
 **Threshold tuning (why 0.15/0.10 and not GDino's default 0.25/0.25).** Drone wildlife is small and distant; GDino's web-imagery-tuned defaults suppress most animals at altitude. 0.15 box / 0.10 text keeps noisy detections that the 3D cube head can still refine. If the full run comes back with <1 box per image on average, drop to 0.10/0.05 and re-run; if recall looks fine, stay at 0.15/0.10 for paper consistency.
 
+**Preprocessing must use `load_image`, not a hand-rolled normalize.** GroundingDINO expects images resized to min-side 800 / max-side 1333 before normalization (`RandomResize([800], max_size=1333)`). Feeding native drone resolution (typ. 1920×1080) raw silently produces boxes with **median IoU ≈ 0.10** against GT — almost nothing matches and downstream 3D AP is zero. Using `from groundingdino.util.inference import load_image` applies the transform correctly and jumps median IoU to **~0.97** on the same images. [tools/precompute_gdino_oracle.py](tools/precompute_gdino_oracle.py)'s `preprocess_image` already does this — do not bypass it with a custom preprocessor when porting to another architecture's 2D wrapper.
+
 **Oracle JSON schema** (produced by `tools/precompute_gdino_oracle.py`, consumed by the evaluator via `DATASETS.ORACLE2D_FILES`):
 
 ```jsonc
@@ -1542,6 +1544,7 @@ Then include this row in the comparison report alongside the existing `ORACLE2D=
 
 - **Use `pip install groundingdino-py==0.4.0`** — not the github clone (no Python fallback → crashes), not `groundingdino==0.1.0` (CPU-only fallback → 41 s/img, 60× slower). This one detail cost us ~2 hours of CUDA-build debugging this session. §3.1 now calls this out prominently.
 - **Thresholds are domain-specific.** Drone wildlife needs 0.15/0.10 (not GDino's default 0.25/0.25). See §6.4.3 for the reasoning.
+- **Preprocessing must include the resize.** Using a custom `pil_to_tensor + normalize` (no resize) silently produced median-IoU-0.10 boxes. Always call `from groundingdino.util.inference import load_image`. This silent failure mode wasted a full 2.5 h precompute.
 - **Don't chase the CUDA rebuild.** CUDA 12.2+ on this cluster's glibc has an unfixable `cospi`/`sinpi` `noexcept` mismatch. `groundingdino-py`'s Python GPU fallback is within ~10× of the compiled op and perfectly adequate for a one-time 13 k precompute.
 
 ### 21.4 Remaining work (do next)

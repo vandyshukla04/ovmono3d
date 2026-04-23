@@ -101,19 +101,18 @@ def load_gdino(config_path: Path, ckpt_path: Path, device: str):
 
 
 def preprocess_image(img_path: Path, device: str):
-    """GroundingDINO expects a normalized 3xHxW tensor. Replicate their
-    util.inference.load_image (which uses PIL + torchvision transforms),
-    staying framework-agnostic."""
-    from PIL import Image
-    import torchvision.transforms.functional as F
+    """GroundingDINO requires its `load_image` transform: RandomResize to
+    min-side 800 / max-side 1333, then ImageNet normalize. Skipping the
+    resize (feeding native 1920x1080 drone frames raw) wrecked 2D box
+    quality — median IoU vs GT collapsed from 0.97 to 0.10.
 
-    im = Image.open(img_path).convert("RGB")
-    # GDino's default: normalize with ImageNet stats after resize to min-side 800
-    # We keep native resolution to match what downstream uses; GDino internally
-    # resizes to its expected range.
-    t = F.pil_to_tensor(im).float() / 255.0
-    t = F.normalize(t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    return t.to(device), im.size[::-1]  # (C,H,W), (H,W)
+    `groundingdino.util.inference.load_image` returns (original_np, tensor);
+    we need the original dims for un-normalizing predicted boxes back to
+    pixel coordinates in the original frame."""
+    from groundingdino.util.inference import load_image
+    src, t = load_image(str(img_path))  # src: HxWx3 numpy (original), t: CxH'xW' tensor (resized+normalized)
+    H, W = src.shape[:2]
+    return t.to(device), (H, W)
 
 
 def run_one(model, image_tensor, text_prompt: str,
