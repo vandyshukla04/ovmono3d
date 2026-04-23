@@ -1006,6 +1006,16 @@ class Omni3DEvaluator(COCOEvaluator):
             reverse_id_mapping = {v: k for k, v in dataset_id_to_contiguous_id.items()}
             for result in omni_results:
                 category_id = result["category_id"]
+                # Normalize to contiguous-id space. Predictions can arrive as:
+                #   (a) Contiguous-id (normal fine-tuned flow): 0..N-1
+                #   (b) Dataset-id (ORACLE2D=True flow, where the oracle JSON
+                #       provides dataset-space ids 1000..1005 and they pass
+                #       through to the output unchanged). Without this
+                #       conversion every oracle prediction is >= num_classes
+                #       and the next filter drops them all ("zero in-vocab
+                #       predictions" warning).
+                if category_id in dataset_id_to_contiguous_id:
+                    category_id = dataset_id_to_contiguous_id[category_id]
                 # A model head trained with NUM_CLASSES larger than this
                 # dataset's vocab (e.g. 50-class pretrained head evaluated
                 # on a 2-class wildlife split) may emit out-of-vocab class

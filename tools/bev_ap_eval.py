@@ -138,9 +138,20 @@ def gt_bev_by_img(gt: Dict,
 
 
 def pred_bev_by_img(preds: List[Dict],
-                    score_min: float = 0.0) -> Dict[int, List[Dict]]:
+                    score_min: float = 0.0,
+                    dataset_id_to_contiguous: Optional[Dict[int, int]] = None
+                    ) -> Dict[int, List[Dict]]:
     """Same as GT but for predictions: reads OVMono3D's center_cam + pose
-    + dimensions and builds the BEV polygon."""
+    + dimensions and builds the BEV polygon.
+
+    Predictions can carry *either* contiguous-ids (fine-tuned path, what
+    train_net.py emits after class filtering) or dataset-ids (ORACLE2D=True
+    path, where category_id is passed through from the oracle JSON which
+    stores dataset-space ids 1000..1005). We detect which and convert to
+    contiguous form so the per-class filter in compute_bev_ap_at_iou works
+    in both cases. Heuristic: if the id is present in the dataset→contig
+    mapping, it's a dataset-id; otherwise assume it's already contiguous.
+    """
     out: Dict[int, List[Dict]] = {}
     for im in preds:
         img_id = im["image_id"]
@@ -161,10 +172,13 @@ def pred_bev_by_img(preds: List[Dict],
             poly = bev_footprint(center, dims, pose)
             if poly is None:
                 continue
+            cid = int(inst["category_id"])
+            if dataset_id_to_contiguous is not None and cid in dataset_id_to_contiguous:
+                cid = dataset_id_to_contiguous[cid]
             out.setdefault(img_id, []).append({
                 "poly": poly,
                 "score": score,
-                "category_id": int(inst["category_id"]),
+                "category_id": cid,
             })
     return out
 
@@ -285,7 +299,11 @@ def main():
     # Build per-image BEV polygons for GT + preds
     print("Building BEV footprints ...", flush=True)
     gts_by_img = gt_bev_by_img(gt, dataset_id_to_contiguous)
-    preds_by_img = pred_bev_by_img(preds, score_min=args.score_min)
+    preds_by_img = pred_bev_by_img(
+        preds,
+        score_min=args.score_min,
+        dataset_id_to_contiguous=dataset_id_to_contiguous,
+    )
 
     n_preds_total = sum(len(v) for v in preds_by_img.values())
     n_gt_total = sum(len(v) for v in gts_by_img.values())
