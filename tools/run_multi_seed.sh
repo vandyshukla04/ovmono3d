@@ -31,11 +31,28 @@
 
 set -euo pipefail
 
-# Fail fast if we haven't renamed zebra -> grevys_zebra yet (reviewer #3)
-if grep -q '"zebra"' configs/wildbox/category_meta_wildlife5.json 2>/dev/null; then
-    echo "ERROR: 'zebra' is still present in category_meta_wildlife5.json."
-    echo "Run the rename first: python tools/rename_zebra_to_grevys.py"
-    exit 1
+# Fail fast if the active symlink still has the unsplit "zebra" class.
+# Guard against: (a) 5-species rename not yet applied, AND (b) forgetting
+# to flip the symlink to wildlife6 when running the 6-species config.
+# We check the symlink, not any specific file, so this works for both the
+# 5-species (post-rename) and 6-species paths.
+if [ -e configs/category_meta.json ]; then
+    if python -c "
+import json, sys
+d = json.load(open('configs/category_meta.json'))
+tc = d.get('thing_classes', [])
+if 'zebra' in tc and 'grevys_zebra' not in tc:
+    sys.exit(1)
+" 2>/dev/null; then
+        :  # passed
+    else
+        echo "ERROR: configs/category_meta.json contains an unsplit 'zebra' class."
+        echo "Either:"
+        echo "  5-species path: python tools/rename_zebra_to_grevys.py"
+        echo "  6-species path: ln -sf wildbox/category_meta_wildlife6.json configs/category_meta.json"
+        echo "                   ln -sf category_meta_wildlife6.json configs/wildbox/category_meta.json"
+        exit 1
+    fi
 fi
 
 CONFIG="${CONFIG:-configs/wildbox/OVMono3D_wildbox_wildlife5.yaml}"
