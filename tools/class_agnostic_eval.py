@@ -268,6 +268,15 @@ def main():
         img_id = im["image_id"]
         for inst in im.get("instances", []):
             c = int(inst["category_id"])
+            # Normalize to contiguous-id space. Predictions may arrive as
+            # either contiguous-id (normal fine-tuned flow, 0..N-1) or
+            # dataset-id (ORACLE2D=True flow, where 1000..1005 pass through
+            # from the oracle JSON). Without this, the `c not in
+            # per_class_preds` test drops every oracle prediction and
+            # macro-AP collapses to 0 even when micro (class-agnostic) is
+            # 88.24.
+            if c in dataset_to_contiguous:
+                c = dataset_to_contiguous[c]
             if c not in per_class_preds:
                 continue  # OOV contiguous class from 50-head
             box = list(inst["bbox"])

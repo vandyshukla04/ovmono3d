@@ -272,8 +272,12 @@ def render_main_table_md(runs: List[Dict[str, Any]], classes: List[str]) -> str:
             #     class AP in the table, regardless of threshold).
             #   - Rel-AP_3D uses the 3D-Rel mode entries from the log.
             #   - 2D AP micro = AP50; per-class is IoU 0.50:0.95 mean.
-            ("AP_BEV @ 0.25", _bev_row(run, 0.25, classes)),
-            ("AP_BEV @ 0.50", _bev_row(run, 0.50, classes)),
+            # AP_BEV @ 0.50 is the primary BEV metric for the paper (tighter
+            # IoU, comparable to KITTI BEV AP convention). @0.25 kept as a
+            # supplementary row for looser-match reference on long-tail
+            # classes with small absolute 3D errors.
+            ("AP_BEV @ 0.50 (primary)", _bev_row(run, 0.50, classes)),
+            ("AP_BEV @ 0.25 (supplementary)", _bev_row(run, 0.25, classes)),
             ("AP_3D @ 0.25 (per-class: AP 0.05:0.50)",  _ap3d_row(run, "AP25", classes)),
             ("Rel-AP_3D (per-class: AP 0.05:0.50)",      _relap_row(run, classes)),
             ("AP_2D @ 0.50 (per-class: AP 0.50:0.95)",   _ap2d_row(run, "AP50", classes)),
@@ -455,8 +459,10 @@ def render_report_md(runs: List[Dict[str, Any]], ds: Dict[str, Any],
                          f"NHD (xy={disent.get('xy', 0):.2f}, "
                          f"dims={disent.get('dimensions', 0):.2f}, "
                          f"pose={disent.get('pose', 0):.2f}), confirming depth as "
-                         f"the primary 3D error source. BEV factors this out, "
-                         f"hence AP_BEV is our primary metric.")
+                         f"the primary 3D error source. BEV factors this out; "
+                         f"we report **AP_BEV @ 0.50 as the primary 3D metric** "
+                         f"(KITTI-convention tight IoU) with AP_BEV @ 0.25 as "
+                         f"supplementary.")
 
     lines.append("")
     lines.append("## Appendix pointers")
