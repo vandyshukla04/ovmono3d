@@ -11,12 +11,14 @@ DATALOADER:
   REPEAT_THRESHOLD: 0.5
   NUM_WORKERS: 8
 SOLVER:
-  # Batch 8 + LR 2e-3 matches the multi-seed protocol (faster per-iter
-  # than the 20k-iter batch-4 base config and at the same effective LR).
+  # Batch 8 + LR 2e-3. With 4x more training data than the 5-species
+  # baseline (45,979 vs ~13,361 frames), 15k iters gives ~2.6 epochs --
+  # the convergence recommendation from WILDBOX_EXPERIMENT.md §16.1 for
+  # long-tail classes. Each seed ~5h, 3 seeds ~15h overnight.
   IMS_PER_BATCH: 8
   BASE_LR: 0.002
-  MAX_ITER: 10000
-  STEPS: (6000, 9000)
+  MAX_ITER: 15000
+  STEPS: (9000, 13500)
   WARMUP_ITERS: 500
   CHECKPOINT_PERIOD: 5000
   AMP:
