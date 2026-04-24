@@ -1,0 +1,31 @@
+_BASE_: "OVMono3D_wildbox_wildlife6.yaml"
+
+# Paper-protocol zero-shot on the 6-species setup: use precomputed
+# GroundingDINO 2D boxes as "oracle" input to the 3D cube head.
+# Produced by tools/precompute_gdino_oracle.py. See WILDBOX_EXPERIMENT.md §6.4.
+TEST:
+  ORACLE2D: True
+  # Extend Rel-AP3D scale search for zero-shot: pretrained Omni3D-metric
+  # predictions need aggressive down-scaling (best-scale ~0.1-0.3) to
+  # align with WildBox's median-|Z|=1 synthetic scale.
+  REL_AP3D_SEARCH: [0.05, 3.0, 32]
+
+DATASETS:
+  # Evaluator's class-mode hardcoded lookup path:
+  #   cfg.DATASETS.ORACLE2D_FILES[EVAL_MODE].<mode>.<dataset_name>
+  # Register WildBox_val under both target_aware and previous_metric so
+  # either EVAL_MODE setting works.
+  ORACLE2D_FILES:
+    EVAL_MODE: target_aware
+    target_aware:
+      novel:
+        WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+      base:
+        WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+    previous_metric:
+      novel:
+        WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+      base:
+        WildBox_val: datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+
+OUTPUT_DIR: "output/ovmono3d_wildbox_wildlife6_oracle2d"
