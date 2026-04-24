@@ -1,4 +1,12 @@
 _BASE_: "OVMono3D_wildbox_finetune.yaml"
+MODEL:
+  # Reduce the ROI head from the Omni3D-pretrained 50-class default to
+  # our 6 wildlife classes. Without this override the pretrained head is
+  # retained and training outputs all 50 Omni3D class ids — the evaluator
+  # filters to 0-5 and per-class AP collapses. Checked in after discovery
+  # via raw instances_predictions.pth (see §21.3.6).
+  ROI_HEADS:
+    NUM_CLASSES: 6
 DATASETS:
   CATEGORY_NAMES: ('rhino', 'elephant', 'plains_zebra', 'grevys_zebra', 'giraffe', 'gazelle')
   CATEGORY_NAMES_NOVEL: ('rhino', 'elephant', 'plains_zebra', 'grevys_zebra', 'giraffe', 'gazelle')

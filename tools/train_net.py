@@ -180,10 +180,19 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, resume=F
         checkpointer.load(cfg.MODEL.WEIGHTS_PRETRAIN, checkpointables=[])
 
     # determine the starting iteration, if resuming
-    start_iter = (checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1)
+    load_result = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume)
+    # BUGFIX: only honor the checkpoint's stored iteration when actually
+    # resuming. Without this guard, fine-tuning from a pretrained weights
+    # file (e.g. ovmono3d_lift.pth, which has iteration=115999 baked in
+    # from its Omni3D pre-training) silently sets start_iter to 116000
+    # which exceeds any reasonable MAX_ITER, so the training loop exits
+    # immediately with no error and model_final.pth is saved unchanged.
+    # Caught when 6-species multi-seed produced 0 iter log lines and
+    # model_final.pth byte-identical to ovmono3d_lift.pth.
+    start_iter = (load_result.get("iteration", -1) + 1) if resume else 0
     iteration = start_iter
 
-    logger.info("Starting training from iteration {}".format(start_iter))
+    logger.info("Starting training from iteration {} (resume={})".format(start_iter, resume))
 
     if not cfg.MODEL.USE_BN:
         freeze_bn(model)
