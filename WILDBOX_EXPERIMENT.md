@@ -9,12 +9,17 @@
 ## 1. TL;DR
 
 - **Task.** Monocular 3D detection of African wildlife from aerial drone footage.
-- **Species (current run).** rhino, elephant, zebra, giraffe, gazelle (5 classes).
-- **Dataset.** WildBox — custom, ~65k frames, ~243k bboxes, ~68 videos across 12 campaigns. 3D GT is pseudo-labels from SAM3 → VGGT pipeline.
+- **Species (paper).** 6 classes: giraffe, grevys_zebra, elephant, plains_zebra, rhino, gazelle (contiguous ids 0-5; dataset ids 1000, 1001, 1002, 1003, 1004, 1005).
+- **Dataset.** WildBox — 15 drone campaign zips, **59 758 frames, 237 505 3D-cuboid instances, 64 videos**. Paper-ready stats auto-regenerated every prep (`tools/dataset_stats.py`). 3D GT is pseudo-labels from SAM3-tight 2D + VGGT reconstruction.
 - **Architecture.** OVMono3D-lift (Cube R-CNN variant, DINOv2 ViT-B/14 backbone). Fine-tuned from `ovmono3d_lift.pth`.
-- **Training.** 10 000 iterations (batch 8, LR 2e-3, AMP, 8 workers). ~3.5 hours on A40. 20k iter schedule recommended for future runs (see §10).
-- **Primary metric.** AP-BEV @ IoU 0.25. Secondary: AP-3D @ 0.25, Rel-AP-3D (LabelAny3D), 2D AP @ 0.5.
-- **Split.** Video-level, seed=0, 80/20. **No leakage.**
+- **Training.** 15 000 iterations (batch 8, LR 2e-3, AMP, REPEAT_THRESHOLD=0.5). 3 seeds for mean±std on rare classes (giraffe, gazelle, grevys_zebra — all ≤5 train videos). ~5 h per seed, ~15 h total on A40.
+- **Evaluation.** Three-row comparison for every paper table:
+  1. Zero-shot with model's own RPN (`TEST.ORACLE2D=False`) — closed-vocab baseline
+  2. Zero-shot paper-protocol (`TEST.ORACLE2D=True`, GroundingDINO oracle 2D boxes) — OVMono3D paper convention
+  3. Fine-tuned (multi-seed wildlife6)
+- **Primary metric.** **AP-BEV @ IoU 0.50** (KITTI-convention tight IoU). Supplementary: AP-BEV@0.25, AP-3D@0.25, Rel-AP-3D (LabelAny3D), 2D AP @ 0.5, class-agnostic 2D AP, disentangled NHD.
+- **Split.** Video-level, seed=0, 80/20 — 51 train / 13 val videos, zero video-level leakage.
+- **Start here for ops.** [FINAL_RUN.md](FINAL_RUN.md) is the 13-step linear pipeline. [QUICK_START_SMOKE_TEST.md](QUICK_START_SMOKE_TEST.md) is the 2-h smoke.
 
 ---
 
@@ -26,37 +31,50 @@
 - Species labels via text-prompted SAM3 segmentation.
 - 3D cuboids via VGGT 3D reconstruction + tracking on the masked frames.
 
-### 2.2 Data inventory (12 campaigns)
+### 2.2 Data inventory (15 campaign zips, 6 species)
 
-Pending zip transfers are tracked in [datasets/pending_sources.txt](datasets/pending_sources.txt).
+The canonical snapshot lives in `datasets/Omni3D/dataset_stats/dataset_stats.md` — regenerated every prep via `tools/dataset_stats.py`. The static inventory below lists the source zips; actual per-class counts in train/val splits come from the auto-generated stats file.
 
-| Zip path | Species | Frames | Bboxes | Segments | Videos |
-|---|---|---:|---:|---:|---:|
-| archive/data202401KRhinos | rhino | 9 779 | 30 128 | 53 | 7 |
-| archive/data202502KRhinoCamiV1 | rhino | 5 107 | 5 099 | 28 | 4 |
-| archive/data202502KRhinoCamiV2 | rhino | 8 450 | 15 885 | 47 | 12 |
-| archive/data202401KElephants | elephant | 5 527 | 6 562 | 34 | 6 |
-| archive/data202406KElephants | elephant | 3 369 | 4 962 | 21 | 4 |
-| archive/data202602KElephants | elephant | 5 300 | 31 406 | 33 | 7 |
-| archive/wildbox_tomblair | Plains zebra | 4 627 | 9 218 | 25 | 3 |
-| archive/dataBZS | Plains zebra | 9 300 | 53 236 | 53 | 12 |
-| archive/data2023KABRZebras | Grévy's zebra | 4 610 | 23 048 | 30 | 5 |
-| archive/data202401KGiraffes | giraffe | 1 220 | 3 297 | 8 | 2 |
-| archive/data202501KGiraffes | giraffe | 310 | 391 | 2 | 2 |
-| archive/data202406KGazelles | gazelle | 7 443 | 59 399 | 39 | 4 |
+| Zip path | Species (class) | Notes |
+|---|---|---|
+| archive/data202401KGiraffes | giraffe | main giraffe source |
+| archive/data202501KGiraffes | giraffe | small supplementary |
+| archive/data2023KABRZebras | grevys_zebra | KABR reserve — the *only* Grévy's zebra source |
+| archive/wildbox_tomblair | plains_zebra | |
+| archive/dataBZS | plains_zebra | |
+| archive/data202307KZebras | plains_zebra | |
+| archive/202401KZebras | plains_zebra | |
+| archive/data202401KElephants | elephant | |
+| archive/data202406KElephants | elephant | |
+| archive/data202501KElephants | elephant | |
+| archive/data202602KElephants | elephant | |
+| archive/data202401KRhinos | rhino | |
+| archive/data202502KRhinoCamiV1 | rhino | |
+| archive/data202502KRhinoCamiV2 | rhino | |
+| archive/data202406KGazelles | gazelle | only gazelle source |
 
-**Per-species totals (all 12 zips, target for full reproduction):**
+**Current aggregate (from dataset_stats.md after prepare on 2026-04-24):**
 
-| Species | Frames | Bboxes | Segments | Videos |
+| Split | Videos | Segments | Frames | Boxes |
 |---|---:|---:|---:|---:|
-| Rhino | 23 336 | 51 112 | 128 | 23 |
-| Elephant | 14 196 | 42 930 | 88 | 17 |
-| Zebra (Plains + Grévy's) | 18 537 | 85 502 | 108 | 20 |
-| Giraffe | 1 530 | 3 688 | 10 | 4 |
-| Gazelle | 7 443 | 59 399 | 39 | 4 |
-| **Total** | **~65 000** | **~243 000** | **~373** | **~68** |
+| Train | 51 | 263 | 45 979 | 170 554 |
+| Val | 13 | 82 | 13 779 | 66 951 |
+| **Total** | **64** | **345** | **59 758** | **237 505** |
 
-**Note on first run:** completed 2026-04-21 with 10 of 12 zips (2 elephant zips + 1 rhino zip were still transferring). Current model is "10-zip" data-ablation; full 12-zip retrain is the main paper result once transfers complete.
+**Per-species train/val video counts (the rare classes determine multi-seed policy):**
+
+| Species | train vids | val vids | Rare? (≤5 vids) |
+|---|---:|---:|---|
+| elephant | 14 | 3 | |
+| gazelle | 3 | 1 | **YES** |
+| giraffe | 3 | 1 | **YES** — val is thin (110 boxes) |
+| grevys_zebra | 4 | 1 | **YES** |
+| plains_zebra | 12 | 3 | |
+| rhino | 15 | 4 | |
+
+Rare-class classes get 3-seed mean±std in the paper; stable classes get single-seed.
+
+**Zebra species provenance** (paper text): per user confirmation, `data2023KABRZebras` contains exclusively Grévy's zebra (*Equus grevyi*); the other four zebra zips (tomblair, BZS, 202307K, 202401K) are plains zebra (*Equus quagga*). Paper dataset section must state this.
 
 ### 2.3 Per-segment data layout
 
@@ -256,7 +274,16 @@ pip install shapely openpyxl   # BEV IoU + xlsx readers
 ### 3.1 Known environment issues
 
 - **pytorch3d CUDA build failure on CUDA 12.x with newer glibc.** The cluster's glibc rejects CUDA's `cospi`/`sinpi` declarations. Workaround already in the code: the Rel-AP3D scale search forces CPU tensors (see `cubercnn/evaluation/omni3d_evaluation.py:search_rel_scale`). CPU `box3d_overlap` works on our pinned commit (055ab3a). Don't try to force `FORCE_CUDA=1` unless you're on a cluster with compatible glibc.
-- **Pretrained checkpoint's `iteration` field silently skipped training** (caught 2026-04-24, commit f894ab6). `ovmono3d_lift.pth` stores `iteration=115999` from Omni3D pre-training. [tools/train_net.py:183](tools/train_net.py#L183) previously read this field unconditionally (regardless of `resume` flag) and set `start_iter=116000`. Any fine-tune with `MAX_ITER<116000` silently exited the training loop with zero iterations — no error, no stack trace, just a `model_final.pth` byte-identical to the pretrained. How to spot: `grep -cE "iter: [0-9]+" log.txt` returns 0, or the single log line `Starting training from iteration 116000 (resume=False)`. Fix in the code now respects `resume=False` → `start_iter=0`; the backup belt-and-suspenders is to strip iteration from the pretrained:
+- **Pretrained checkpoint's `iteration` field silently skipped training** (caught 2026-04-24, commit f894ab6). `ovmono3d_lift.pth` stores `iteration=115999` from Omni3D pre-training. [tools/train_net.py:183](tools/train_net.py#L183) previously read this field unconditionally (regardless of `resume` flag) and set `start_iter=116000`. Any fine-tune with `MAX_ITER<116000` silently exited the training loop with zero iterations — no error, no stack trace, just a `model_final.pth` byte-identical to the pretrained.
+
+  **How to spot (red flags in the log — the first two of which we MISSED on the bad run):**
+  1. The startup log says `[DatasetMapper] Augmentations used in inference: [ResizeShortestEdge(...)]` but NEVER says `Augmentations used in training: [...RandomFlip(), multi-scale resize...]`. Real training always logs both, since it uses separate augmentation pipelines for train vs periodic eval. Single "inference" augmentations = the training loop was never entered.
+  2. The log jumps from `Environment info` directly to `Start inference on N batches` within 1-2 minutes of launch. Real training spends hours between those events, emitting `iter: 100 total_loss: 1.234 ...` lines every 20 iterations.
+  3. `grep -cE "iter: [0-9]+" log.txt` returns 0.
+  4. The single log line `Starting training from iteration 116000 (resume=False)` — definitive.
+  5. `model_final.pth` is byte-identical to `ovmono3d_lift.pth` (same 603,232,016-byte file).
+
+  Fix in the code now respects `resume=False` → `start_iter=0`; the backup belt-and-suspenders is to strip iteration from the pretrained:
   ```bash
   python -c "
   import torch
@@ -730,58 +757,7 @@ Class-agnostic 2D AP (via [tools/class_agnostic_eval.py](tools/class_agnostic_ev
 
 ## 9. Reproducing on another architecture
 
-Everything in §2 (dataset/preprocessing) and §6 (evaluation) is architecture-agnostic. Only §5 (the model/loss config) is specific.
-
-### 9.1 Transfer directly
-
-- Omni3D-format JSONs from `prepare_wildbox_dataset.py`.
-- Evaluation tooling (`bev_ap_eval.py`, `class_agnostic_eval.py`, `make_report.py`). All consume `instances_predictions.pth` which any Detectron2 architecture produces automatically.
-- Video-level split (`--split-mode video --seed 0`).
-- SAM3-tight 2D bbox convention (via the prep script).
-- Per-segment scale normalization (encoded in GT, not model).
-
-### 9.2 Re-implement per architecture
-
-| Item | Cube R-CNN | DetAny3D | Generic 3D detector |
-|---|---|---|---|
-| Config matching | Drop-in; change backbone only | Adapt loader to read our K + bbox | Match the hparams below |
-| `LOSS_W_Z` down-weighting | Keep 0.5× | Apply 0.5× on its depth loss | Apply to whatever depth-regressing loss exists |
-| Virtual depth | Set False | Set equivalent | Skip — we're in VGGT synthetic scale |
-| Pose parameterization | Keep 6D continuous | Keep quaternion or 6D, NOT yaw-only | Use 3-DoF representation (full R) |
-| Class-balanced sampler | `REPEAT_FACTOR_TRAINING_SAMPLER` | WeightedRandomSampler with `sqrt(1/cnt)` | Same |
-
-### 9.3 Minimum config to match
-
-```
-BACKBONE pretraining       = Omni3D or COCO (not ImageNet alone)
-BATCH SIZE                 = 8 per A40 (16 on A100-80GB)
-LR                         = 0.002 SGD (linearly scale with batch), step at 60%/90%
-WARMUP                     = 5% of MAX_ITER
-MAX_ITER                   = 10 000 at batch 8 (→ 20 000 at batch 4)
-AUGMENTATION               = horizontal flip, random-scale short-edge (280..392)
-INPUT RESOLUTION           = short-edge 294, max-edge 560
-CLASS BALANCING            = repeat-factor threshold 0.25 (0.5 for very severe long-tail)
-OPTIMIZER                  = SGD momentum 0.9 (or AdamW with LR/2)
-AMP                        = ENABLED True on Ampere+; disable if NaNs appear
-```
-
-### 9.4 What the eval tools expect from the prediction output
-
-For each predicted instance, in the saved `instances_predictions.pth`:
-
-```python
-{
-    "image_id": int,
-    "bbox": [x, y, w, h],               # xywh in image pixels
-    "score": float,
-    "category_id": int,                 # contiguous id, 0..N-1
-    "center_cam": [x, y, z],            # camera-frame
-    "dimensions": [W, H, L],            # Omni3D ordering
-    "pose": [[...]*3]*3 or [9 floats]   # 3x3 or flattened
-}
-```
-
-Any Detectron2 `COCOEvaluator`-compatible pipeline already writes this format.
+**See §20 — full cross-architecture protocol** (portable oracle-JSON contract, consumer-side eval wiring, side-by-side reporting table, 5-step adoption checklist).
 
 ---
 
@@ -871,31 +847,30 @@ Expected: +5-10 3D AP, especially on long-tail.
 
 ## 13. Changelog vs first version
 
-| Fix / feature | Where | Why |
+Features and tools added relative to upstream OVMono3D. Bugs caught during development are in §21.2 (don't duplicate here).
+
+| Feature / tool | Where | Purpose |
 |---|---|---|
-| Zip auto-extract with sibling `*_unzipped/` cache | `prepare_wildbox_dataset.py:resolve_source_path` | Don't re-extract on every run |
-| Skip corrupt / in-progress zips with warning | same | A partial transfer no longer aborts the whole prep |
-| SAM3 tight 2D bboxes | `prepare_wildbox_dataset.py` | Cuboid projection is always loose |
-| Video-level split | `prepare_wildbox_dataset.py:auto_split` | Segment-level leaks |
-| Rel-AP-3D CPU scale search | `cubercnn/evaluation/omni3d_evaluation.py:search_rel_scale` | pytorch3d CUDA unavailable |
-| Zero-shot evaluator short-circuit | same file | Empty in-vocab predictions no longer crash eval |
+| Zip-aware data prep with caching + skip-corrupt | `prepare_wildbox_dataset.py` | Don't re-extract on re-prep; partial transfers don't abort |
+| SAM3 tight 2D bboxes | `prepare_wildbox_dataset.py` | Cuboid projection is always loose — SAM3 masks give paper-quality 2D |
+| Video-level split | `prepare_wildbox_dataset.py:auto_split` | Segment-level leaks; video-level doesn't |
+| Auto-generated `category_meta_wildlifeN.json` | `prepare_wildbox_dataset.py` | Sort order matches training's internal mapping |
+| Dataset inventory auto-generator | `tools/dataset_stats.py` | Paper-ready per-species stats + size distribution PNG, regenerated every prep |
+| GroundingDINO oracle precompute | `tools/precompute_gdino_oracle.py` + `OVMono3D_wildbox_wildlife5_oracle2d.yaml` | Paper-protocol zero-shot (`TEST.ORACLE2D=True`) |
+| BEV AP (primary paper metric) | `tools/bev_ap_eval.py` | Shapely rotated-rectangle IoU; micro/macro/per-class |
+| Class-agnostic 2D AP + NHD 3D surrogate | `tools/class_agnostic_eval.py` | Meaningful zero-shot number when standard AP is 0 |
+| `make_report.py` with `--compare` | new | Single-command multi-row paper table; parses log.txt + log.rel.txt + bev_ap.json |
+| `run_full_eval.sh` | new | One-shot: standard eval + Rel-AP3D + BEV + class-agnostic + report |
+| OVMono3D-faithful novel-view visualizer | `tools/visualize_class_agnostic.py` | Separate 2D/3D/novel-view panels, per-id colors, ground grid toggle |
+| Training-curves plotter with key discovery | `tools/plot_training.py` | Robust to metric-key naming drift across detectron2 versions |
+| `remap_wildbox_paths.py` | new | Path rescue when data moves, preserves split |
+| Multi-seed launcher + aggregator | `tools/run_multi_seed.sh` + `tools/aggregate_seed_ap.py` | 3-seed mean±std for rare classes |
+| Rel-AP3D boundary checker | `tools/check_rel_ap3d_boundary.py` | Confirms scale-search grid is adequate (reviewer #2) |
+| Per-block Rel-AP3D scale search + progress prints | `cubercnn/evaluation/omni3d_evaluation.py:search_rel_scale` | Old flat-list approach was O(N×M) per scale — never finished on 13k val images |
+| dataset_id → contiguous_id normalization in evaluators | bev_ap_eval + class_agnostic_eval + omni3d_evaluation | Handles both fine-tuned (contiguous) and ORACLE2D=True (dataset-id) prediction formats |
 | Training-safe vis try/except | `tools/train_net.py:do_test` | Vis exceptions never kill training |
-| Defensive category-id lookup in vis | `cubercnn/vis/vis.py` | Handles both contiguous and dataset-id inputs |
-| `bev_ap_eval.py` | new | Primary metric (paper) |
-| `class_agnostic_eval.py --nhd` + macro-AP | new / updated | Zero-shot diagnostic + scale-invariant 3D surrogate |
-| `make_report.py` with `--compare` | new | Single-command paper table |
-| `run_full_eval.sh` | new | One-shot: eval + Rel-AP3D + BEV + NHD + report |
-| Robust per-class log parser | `make_report.py` | Global regex instead of positional — all species captured |
-| `visualize_class_agnostic.py` triplet output | new | Separate gt_only/pred_only/combined per sample |
-| `plot_training.py` key discovery + full key dump | new | Debug metric-key naming drift across detectron2 versions |
-| `remap_wildbox_paths.py` | new | Path rescue when data moves, without invalidating split |
-| `patch_stats_for_wildbox.py` idempotency | same | Re-running is safe |
-| **category_meta_wildlife*.json ordering fix** | both files + auto-gen in prep script | Training's auto mapping sorts by dataset-id; our hand-written meta didn't match → all per-class metrics collapsed to 0 for 4/5 classes. Fixed by matching the sort order and auto-generating from prep |
-| `make_report.py` detects single-nonzero-class case | `parse_standard_eval_log` | Loud warning when the above mapping bug recurs |
-| **`configs/wildbox/category_meta.json` symlinked to wildlife5** | new | `train_net.py --eval-only` (line 402) reads this path, not the top-level one. The old Phase-1 giraffe-only file was causing every --eval-only standalone run to report only giraffe |
-| `run_full_eval.sh` auto-syncs both category_meta files | | Prevents the two-files-diverge bug at the source |
-| **`search_rel_scale` switched to per-block IoU computation + progress prints** | `cubercnn/evaluation/omni3d_evaluation.py` | Old flat-list approach built a `box3d_overlap(N_all × M_all)` matrix per scale: for 13k val images that's ~1.6B CPU pair comparisons per scale × 28 scales → never finishes. Per-(img, cat) blocks are orders of magnitude smaller. |
-| **GroundingDINO oracle precompute tool** | new `tools/precompute_gdino_oracle.py` + `configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml` | Matches the OVMono3D paper's zero-shot protocol (`TEST.ORACLE2D=True` with GDino-text-prompted 2D boxes). Our default `ORACLE2D=False` is strictly harder; the paper's Table 1 uses the GDino-based flavor. See §6.4 for the full story. |
+| Zero-shot evaluator short-circuit | `omni3d_evaluation.py` | "zero in-vocab predictions" logs a warning instead of crashing |
+| `resume=False` forces `start_iter=0` | `tools/train_net.py:183` (commit f894ab6) | Pretrained checkpoint's `iteration=115999` no longer silently skips training |
 
 ---
 
@@ -913,210 +888,11 @@ Expected: +5-10 3D AP, especially on long-tail.
 
 ---
 
----
-
 ## 15. Final-run operations guide
 
-This section is what you open when you're ready to produce **the official paper-numbers run**. It's a single top-to-bottom flow, no branches.
+**See [FINAL_RUN.md](FINAL_RUN.md)** — it's the canonical linear pipeline from prereqs to paper-ready tables and figures, organized as 13 copy-pasteable steps with expected outputs at each.
 
-### 15.1 Pre-flight checklist (must all pass before anything else)
-
-Run on **node81** (GPU). Anywhere else risks cv2/libGL errors.
-
-```bash
-ssh node81
-conda activate /storage3/3DOM/vshukla/envs/ovmono3d
-cd /storage2/3DOM/vshukla/repos/ovmono3d
-git pull
-```
-
-Then these six checks, **all must print OK**:
-
-```bash
-# [A] Environment works
-python -c "
-import torch, pytorch3d, detectron2
-assert torch.cuda.is_available(), 'no CUDA'
-from cubercnn.modeling.roi_heads import ROIHeads3D
-print('OK:', torch.cuda.get_device_name(0))
-"
-# Expect: OK: NVIDIA A40
-
-# [B] shapely installed (needed for BEV)
-python -c "import shapely; print('OK shapely', shapely.__version__)"
-# If missing: pip install shapely
-
-# [C] Pretrained checkpoint present
-ls -lh checkpoints/ovmono3d_lift.pth
-
-# [D] Omni3D stats registered for all 5 species
-python -c "
-import json
-s = json.load(open('datasets/Omni3D/stats.json'))
-wildlife = {'rhino', 'elephant', 'zebra', 'giraffe', 'gazelle'}
-for info in s.get('info', []):
-    cats = {c['name'] for c in info.get('category_names', [])}
-    miss = wildlife - cats
-    if miss: print('MISSING:', miss)
-print('OK: stats.json has all 5 species')
-"
-# If any missing: rerun tools/patch_stats_for_wildbox.py
-
-# [E] BOTH category_meta.json files point to wildlife5
-for F in configs/category_meta.json configs/wildbox/category_meta.json; do
-    ls -la "$F" | grep -q wildlife5 && echo "OK: $F -> wildlife5" || {
-        echo "BAD symlink at $F — fixing..."
-        case "$F" in
-            configs/category_meta.json)
-                ln -sf wildbox/category_meta_wildlife5.json "$F" ;;
-            configs/wildbox/category_meta.json)
-                ln -sf category_meta_wildlife5.json "$F" ;;
-        esac
-    }
-done
-
-cat configs/category_meta.json
-cat configs/wildbox/category_meta.json
-# Both MUST show thing_classes = ["giraffe", "zebra", "elephant", "rhino", "gazelle"]
-# With mapping {"1000":0, "1001":1, "1002":2, "1004":3, "1005":4}
-# giraffe FIRST (smallest dataset-id 1000), gazelle LAST (1005)
-
-# [F] Val JSON healthy + no video-level leakage
-python -c "
-import json, os
-from collections import Counter
-for split in ('train','val'):
-    d = json.load(open(f'datasets/Omni3D/WildBox_{split}.json'))
-    cats = Counter(a['category_name'] for a in d['annotations'])
-    vids = {img['file_path'].split('/')[-3] for img in d['images']}
-    missing = sum(1 for img in d['images'][:200] if not os.path.exists(img['file_path']))
-    assert missing == 0, f'{split}: {missing}/200 missing paths'
-    print(f'{split}: {len(d[\"images\"])} imgs, {len(d[\"annotations\"])} anns, '
-          f'{len(vids)} videos, anns_per_class={dict(cats)}')
-train_vids = {img['file_path'].split('/')[-3] for img in json.load(open('datasets/Omni3D/WildBox_train.json'))['images']}
-val_vids   = {img['file_path'].split('/')[-3] for img in json.load(open('datasets/Omni3D/WildBox_val.json'))['images']}
-overlap = len(train_vids & val_vids)
-assert overlap == 0, f'video leakage: {overlap} shared videos'
-print(f'OK: {len(train_vids)} train videos, {len(val_vids)} val videos, no overlap')
-"
-```
-
-Only proceed past this point if all 6 checks printed `OK`.
-
-### 15.2 Zero-shot baseline (step 1 of 3)
-
-```bash
-tmux new -s wb-zs
-bash tools/run_full_eval.sh \
-    --weights checkpoints/ovmono3d_lift.pth \
-    --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     output/final_zeroshot \
-    --label   "zero-shot (pretrained Omni3D)" \
-    --gt      datasets/Omni3D/WildBox_val.json \
-    --skip-rel-ap3d     # no in-vocab predictions -> scale search trivially 0
-```
-Runtime ~15 min. Detach with `Ctrl-b d`.
-
-**Expected output** in `output/final_zeroshot/`:
-- `log.txt` — all-zero primary metrics (expected for closed-vocab)
-- `bev_ap.json` — BEV AP, will also be ~0 on named classes
-- `summary_nhd.txt` — **the meaningful zero-shot number**: class-agnostic 2D AP (~20-40 depending on scene difficulty)
-- `inference/iter_final/WildBox_val/instances_predictions.pth` — raw predictions for downstream tools
-- `paper_report/report.md` — markdown report
-
-### 15.3 Fine-tune training (step 2 of 3)
-
-Recommended config for the paper run:
-
-```bash
-tmux new -s wb-train
-python tools/train_net.py \
-    --config-file configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --num-gpus 1 \
-    SOLVER.IMS_PER_BATCH 8 \
-    SOLVER.BASE_LR 0.002 \
-    SOLVER.MAX_ITER 15000 \
-    SOLVER.STEPS "(9000, 13500)" \
-    SOLVER.WARMUP_ITERS 500 \
-    SOLVER.CHECKPOINT_PERIOD 1000 \
-    TEST.EVAL_PERIOD 5000 \
-    DATALOADER.REPEAT_THRESHOLD 0.5 \
-    OUTPUT_DIR output/final_finetune
-```
-
-Why **15 000 iters, not 10 000**: §10 showed 3D AP was still climbing between iter 5 000 and 10 000 (6.2 → 16.1). Another 5 000 iters should add 3-5 more AP points and help long-tail classes.
-
-Why **REPEAT_THRESHOLD=0.5**: stronger upsampling for giraffe/gazelle (only 4 videos each). Current 0.25 produced giraffe AP 1.8 / gazelle AP 2.3 — too low to report as per-class numbers.
-
-Runtime estimate: ~5 hours on A40 (unshared). Detach with `Ctrl-b d`.
-
-Monitor:
-```bash
-tail -f output/final_finetune/log.txt
-# Latest losses
-python tools/plot_training.py output/final_finetune/metrics.json
-# -> output/final_finetune/training_curves.png
-```
-
-### 15.4 Fine-tuned eval + final report (step 3 of 3)
-
-After training completes:
-
-```bash
-tmux new -s wb-eval-ft
-bash tools/run_full_eval.sh \
-    --weights output/final_finetune/model_final.pth \
-    --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     output/final_finetuned_eval \
-    --label   "fine-tuned (5 species)" \
-    --gt      datasets/Omni3D/WildBox_val.json
-```
-
-Runtime ~25 min (15 min Rel-AP3D CPU scale search + 10 min other steps).
-
-Combined zero-shot vs fine-tuned report:
-
-```bash
-python tools/make_report.py \
-    --run-dir output/final_zeroshot        --label "zero-shot" \
-    --run-dir output/final_finetuned_eval  --label "fine-tuned" \
-    --gt      datasets/Omni3D/WildBox_val.json \
-    --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     output/final_paper_report \
-    --compare
-```
-
-Paper-ready visualizations:
-
-```bash
-python tools/visualize_class_agnostic.py \
-    --preds output/final_finetune/inference/iter_final/WildBox_val/instances_predictions.pth \
-    --gt    datasets/Omni3D/WildBox_val.json \
-    --out   output/final_finetune/vis_agnostic \
-    --top-k 3 --every 100 --limit 40
-
-python tools/visualize_class_agnostic.py \
-    --preds output/final_zeroshot/inference/iter_final/WildBox_val/instances_predictions.pth \
-    --gt    datasets/Omni3D/WildBox_val.json \
-    --out   output/final_zeroshot/vis_agnostic \
-    --top-k 3 --every 100 --limit 40
-```
-
-### 15.5 What to look at in the final report (verification before trusting)
-
-Open `output/final_paper_report/report.md` and check:
-
-1. **`## Validation set` block** — per-class annotation counts match your expectations (rhino and zebra should be the largest, giraffe smallest).
-2. **`## Main metrics table`** — both zero-shot and fine-tuned rows present, **all 5 species columns populated** for fine-tuned. If only 1 class has non-zero values, the symlink was wrong again (check 15.1[E]).
-3. **`## Zero-shot diagnostic`** — check that `Class-agnostic 2D AP@0.50` shows a meaningful zero-shot value (~15-35) and fine-tuned value (~60-85). The gap is the paper's headline.
-4. **`## One-line callout`** — NHD-z should be the largest component (typically 70-85% of overall NHD). This is what justifies BEV-as-primary.
-
-Spot-check individual metrics against the training log:
-```bash
-grep -A 10 "Evaluation results for bbox in 2D mode" output/final_finetuned_eval/log.txt | tail -10
-grep -A 10 "Evaluation results for bbox in 3D mode" output/final_finetuned_eval/log.txt | tail -10
-grep "best global scale" output/final_finetuned_eval/log.rel.txt
-```
+The pre-flight checklist (`tmux` + env + checkpoint + stats.json + symlinks + split integrity) is FINAL_RUN.md §0-§5. The three-row paper report (ORACLE2D=False zero-shot / GDino-oracle zero-shot / fine-tuned multi-seed) is §8-§10. The single gotcha worth re-flagging here: if `grep -E "Starting training from iteration" log.txt` says anything other than `iteration 0 (resume=False)`, training was silently skipped — see §3.1.
 
 ---
 
@@ -1234,84 +1010,28 @@ Same as 17.1 plus:
 
 ## 18. Quick commands cheat sheet
 
-### Training
+**Primary references** — use these, not duplicates of their content here:
+- **[FINAL_RUN.md](FINAL_RUN.md)** — the canonical 13-step pipeline (data prep → training → eval → report → figures). Every command is a single copy-paste block.
+- **[QUICK_START_SMOKE_TEST.md](QUICK_START_SMOKE_TEST.md)** — smallest-zip-per-species end-to-end smoke in ~2 hours.
+- **[§4](#4-prep--train--eval-pipeline-end-to-end)** — same pipeline with per-step rationale.
+
+Only the utilities that aren't in those three docs live here:
+
 ```bash
-# Quick sanity (confirm pipeline)
-python tools/train_net.py --config-file configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --num-gpus 1 SOLVER.MAX_ITER 200 SOLVER.STEPS "(100,150)" SOLVER.CHECKPOINT_PERIOD 100 \
-    TEST.EVAL_PERIOD 100 OUTPUT_DIR output/smoke
-
-# Full paper run
-python tools/train_net.py --config-file configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --num-gpus 1 SOLVER.IMS_PER_BATCH 8 SOLVER.BASE_LR 0.002 \
-    SOLVER.MAX_ITER 15000 SOLVER.STEPS "(9000,13500)" \
-    TEST.EVAL_PERIOD 5000 SOLVER.CHECKPOINT_PERIOD 1000 \
-    DATALOADER.REPEAT_THRESHOLD 0.5 \
-    OUTPUT_DIR output/final_finetune
-
-# Resume
+# Resume a stopped training run (checkpoint is at OUTPUT_DIR/last_checkpoint)
 python tools/train_net.py --config-file <cfg> --num-gpus 1 --resume \
-    OUTPUT_DIR output/final_finetune
-```
+    OUTPUT_DIR output/your_run
 
-### Eval
-```bash
-# Full evaluation (2D + 3D + Rel-AP3D + BEV + NHD + report)
-bash tools/run_full_eval.sh \
-    --weights <ckpt.pth> --config <cfg> --out <dir> --label "name" \
-    --gt datasets/Omni3D/WildBox_val.json [--skip-rel-ap3d]
-```
-
-### Reporting
-```bash
-# Combined zero-shot vs fine-tuned report
-python tools/make_report.py \
-    --run-dir <zs_dir> --label "zero-shot" \
-    --run-dir <ft_dir> --label "fine-tuned" \
-    --gt datasets/Omni3D/WildBox_val.json \
-    --config <cfg> --out <report_out_dir> --compare
-```
-
-### Plots and visualizations
-```bash
-# Training curves
-python tools/plot_training.py <run_dir>/metrics.json
-
-# GT / pred comparison images
-python tools/visualize_class_agnostic.py \
-    --preds <run_dir>/inference/iter_final/WildBox_val/instances_predictions.pth \
-    --gt datasets/Omni3D/WildBox_val.json \
-    --out <run_dir>/vis_agnostic --top-k 3 --every 100 --limit 40
-```
-
-### Data prep
-```bash
-python tools/prepare_wildbox_dataset.py \
-    --source <ZIP>=<species>:<id> \  # repeatable
-    --split-mode video --val-fraction 0.2 --seed 0 \
-    --output-train datasets/Omni3D/WildBox_train.json \
-    --output-val datasets/Omni3D/WildBox_val.json \
-    --dataset-id 1000 -v
-```
-
-### Path rescue
-```bash
-# If data was moved after training:
+# Remap paths after moving the data directory (no re-prep required)
 python tools/remap_wildbox_paths.py datasets/Omni3D/WildBox_val.json \
-    [--map OLD=NEW | --search-root /path/to/data] --in-place
-```
+    [--map OLD=NEW | --search-root /path/to/new/data] --in-place
 
-### Monitoring
-```bash
-# Training loss + ETA
-tail -n 5 <run_dir>/log.txt | grep iter
-
-# Check specific GPU utilization while training
-nvidia-smi --query-compute-apps=pid,used_memory,gpu_bus_id --format=csv
-
-# Which GPU is my job on?
+# Which GPU is your training job on?
 YOUR_PID=$(pgrep -f train_net.py | head -1)
 nvidia-smi --query-compute-apps=pid,gpu_name,used_memory --format=csv | grep "^$YOUR_PID,"
+
+# Tail training loss + ETA from anywhere
+tail -n 5 output/<run_dir>/log.txt | grep iter
 ```
 
 ---
@@ -1501,145 +1221,68 @@ That's the whole contract. If X's zero-shot row is much worse than ours and it's
 
 ---
 
-## 21. Current state (as of 2026-04-22) — pick up here after context compaction
+## 21. Current state (as of 2026-04-24)
 
-This section captures exactly where the experiment stands so the next conversation can resume without re-deriving context.
+Single-paragraph snapshot for resume after compaction: **6-species dataset live (plains_zebra + grevys_zebra split from KABR), 15 zips total, 64 videos, 60k frames, 237k instances, video-level 80/20 split. Multi-seed training (3 seeds × 15k iters × REPEAT_THRESHOLD=0.5) running now after `f894ab6` fixed the silent-skip-training bug.** Results TBD ~18:30 tonight.
 
-### 21.1 What's completed
+### 21.1 What's in place (code + data)
 
-- 5-species training run: `output/wildbox_wl5_finetune/` — 10 000 iterations, batch 8, LR 2e-3, AMP, REPEAT_THRESHOLD 0.25. Final checkpoint: `output/wildbox_wl5_finetune/model_final.pth`.
-- Training-time iter-10000 eval (embedded in `output/wildbox_wl5_finetune/log.txt`) has all 5 classes populated correctly:
-  - 2D AP: 45.9, AP50 90.4, AP75 40.2
-  - Per-class 2D AP: elephant 72.8, rhino 54.6, zebra 37.1, gazelle 35.8, giraffe 29.2
-  - 3D AP: 16.1, AP15 25.4, AP25 16.4
-  - Per-class 3D AP: elephant 45.1, zebra 16.7, rhino 14.7, gazelle 2.3, giraffe 1.8
-  - Disentangled NHD: overall 5.64, xy 1.66, **z 4.74** (dominant), dims 0.76, pose 0.69
-- Training used 11 of 12 zips; 3 pending in [datasets/pending_sources.txt](datasets/pending_sources.txt).
-- Data prep produces SAM3-tight 2D + video-level split.
-- BEV AP + class-agnostic eval tools + report generator all working.
+- **Dataset prep** (`tools/prepare_wildbox_dataset.py`): 15-zip 6-species corpus, SAM3-tight 2D, video-level split. All 15 archive dirs under `/storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/`; unzipped dirs cached alongside.
+- **Dataset stats auto-generator** (`tools/dataset_stats.py`): produces `dataset_stats.md` + `.json` + `size_distribution.png` every prep.
+- **6-species config** ([OVMono3D_wildbox_wildlife6.yaml](configs/wildbox/OVMono3D_wildbox_wildlife6.yaml)): `MODEL.ROI_HEADS.NUM_CLASSES: 6`, `REPEAT_THRESHOLD: 0.5`, `MAX_ITER: 15000`, `REL_AP3D_SEARCH: [0.05, 3.0, 32]`. Symlinks `configs/category_meta.json` and `configs/wildbox/category_meta.json` both point to `category_meta_wildlife6.json`.
+- **Paper-protocol zero-shot pipeline**: GDino oracle JSON at `datasets/Omni3D/gdino_WildBox_val_oracle_2d.json` (2.5h precompute, ~0.7 s/img on A40), evaluator wired via [OVMono3D_wildbox_wildlife5_oracle2d.yaml](configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml). Will need regeneration when val set changes (current oracle file reflects 6222 val images from the 11-zip 5-species prep, not the 13779-image 15-zip 6-species val).
+- **Multi-seed infrastructure**: `tools/run_multi_seed.sh` (3 seeds sequential, resumable), `tools/aggregate_seed_ap.py` (mean±std for rare classes).
+- **Eval infrastructure**: `tools/run_full_eval.sh` covers standard AP + Rel-AP3D + BEV + class-agnostic + NHD; `tools/make_report.py --compare` assembles multi-row tables.
 
-### 21.2 The "per-class metrics are all 0 except giraffe" bug (now fixed)
+### 21.2 Bugs caught and fixed during development
 
-Cause: `tools/train_net.py` in `--eval-only` mode reads `category_meta.json` from the **config file's directory** ([line 402](tools/train_net.py#L402)), not from the top-level `configs/` directory. A leftover Phase-1 file at `configs/wildbox/category_meta.json` had `thing_classes = ["giraffe"]` and was overriding the correct wildlife5 mapping for every standalone eval.
+All fixed in the current codebase (don't re-introduce):
 
-**Fix applied**: `configs/wildbox/category_meta.json` is now a symlink to `category_meta_wildlife5.json`. `tools/run_full_eval.sh` has a sanity check at start that auto-syncs both symlinks.
+| # | Symptom | Root cause | Fix | Commit |
+|---|---|---|---|---|
+| 1 | Per-class metrics all 0 except giraffe during standalone eval | `train_net.py --eval-only` reads `category_meta.json` from the **config file's dir**, not `configs/`. Stale Phase-1 single-class file was winning | Symlink both `configs/category_meta.json` AND `configs/wildbox/category_meta.json` to `category_meta_wildlife6.json`. `run_full_eval.sh` auto-syncs both at start | pre-history |
+| 2 | Rel-AP3D stuck forever | `search_rel_scale` built one giant `box3d_overlap(N×M)` matrix per scale × 28 scales | Per-(image, category) block IoU with progress prints | pre-history |
+| 3 | BEV AP showed `0 preds, 0 GT` per class for ORACLE2D=True | Eval filtered by contiguous-id but oracle preds carry dataset-ids 1000-1005 | Normalize dataset-id → contiguous-id in `pred_bev_by_img` | d8547ed |
+| 4 | Per-class AP macro=0, micro=88 under oracle eval | Same dataset-id/contiguous-id mismatch in `class_agnostic_eval.py` and main COCO evaluator | Same normalization pattern in both | e7de1e6 |
+| 5 | Make_report's Rel-AP_3D row always `-` | Parser only read `log.txt`, not `log.rel.txt` | Concat both before regex | 1da8843 |
+| 6 | GDino oracle boxes had median IoU 0.10 vs GT | `preprocess_image` skipped GDino's `RandomResize([800], max_size=1333)` | Use `groundingdino.util.inference.load_image` directly | e5bf1c9 |
+| 7 | Multi-seed training produced 0 iter lines, `model_final.pth` byte-identical to pretrained (silent "no-training" failure) | `train_net.py:183` read checkpoint's `iteration` field unconditionally regardless of `resume=False`. Pretrained has `iteration=115999`; `start_iter>MAX_ITER` → training loop exited immediately | Respect `resume` flag when reading iteration | f894ab6 |
 
-### 21.3 The Rel-AP3D "stuck forever" bug (now fixed)
+Bug #7 is the silent killer to remember. See §3.1 for the four red flags that should trigger a "training-was-skipped" diagnosis within 2 minutes of launch.
 
-Cause: `search_rel_scale` in [cubercnn/evaluation/omni3d_evaluation.py](cubercnn/evaluation/omni3d_evaluation.py) built ONE giant `box3d_overlap(N_all_preds × M_all_gt)` matrix per scale. For our 13 361-image val set: ~27k preds × ~59k GT = ~1.6B CPU pair comparisons per scale × 28 scales. Effectively never finishes.
+### 21.3 Post-retrain checklist (morning of 2026-04-25)
 
-**Fix applied (commit pending)**: rewrote `search_rel_scale` to compute IoU **per-(image, category) block** instead of as one giant matrix. Sum of per-block comparisons is orders of magnitude smaller. Also added progress printing (`[rel_ap3d] s=X.XXX score=... elapsed=Ns eta=Ns`) so stuckness is observable in real time.
-
-### 21.3.5 Paper-protocol zero-shot (GDino oracle) — in progress
-
-We currently run `TEST.ORACLE2D=False` (model's own RPN), which is stricter than the OVMono3D paper's zero-shot. Matching Table 1 of the paper requires GroundingDINO oracle files.
-
-**Status as of 2026-04-23:** the precompute command is launched on node81 and running overnight; expected done in ~2.5 h. Setup worked on `groundingdino-py==0.4.0` (PyPI) at ~0.7 s/img on A40.
-
-See §6.4.3 for the full protocol (install package → download checkpoint → smoke → full precompute → oracle eval). What to run once the oracle JSON lands:
+When the three-seed wildlife6 run completes:
 
 ```bash
-bash tools/run_full_eval.sh \
-    --weights checkpoints/ovmono3d_lift.pth \
-    --config  configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml \
-    --out     output/wildbox_wl5_zeroshot_oracle2d \
-    --label   "zero-shot (paper protocol, GDino oracle)" \
-    --gt      datasets/Omni3D/WildBox_val.json \
-    --skip-rel-ap3d
+# 1) Sanity — all 3 seeds actually trained (should be NON-empty counts)
+for S in 0 1 2; do
+    D=output/wl6_rt0.5_multiseed/seed$S
+    printf "seed%d: " $S
+    grep -cE "iter: [0-9]+" $D/log.txt
+done
+# Expect: seed0: ~750, seed1: ~750, seed2: ~750 (at default d2 log every 20 iters)
+
+# 2) Per-seed model_final.pth sizes should DIFFER from the 603,232,016-byte pretrained
+stat -c "%s %n" output/wl6_rt0.5_multiseed/seed*/model_final.pth checkpoints/ovmono3d_lift.pth
+
+# 3) Aggregate mean±std
+python tools/aggregate_seed_ap.py \
+    --run-dirs output/wl6_rt0.5_multiseed/seed{0,1,2}/eval \
+    --rare-classes giraffe gazelle grevys_zebra \
+    --classes giraffe grevys_zebra elephant plains_zebra rhino gazelle \
+    --out output/wl6_rt0.5_multiseed/mean_std_report
+
+# 4) Three-row paper report (once oracle JSON is regenerated for the 13779-image val):
+#    See FINAL_RUN.md §9 for the regen command + §10 for the assembly.
 ```
 
-Then include this row in the comparison report alongside the existing `ORACLE2D=False` zero-shot and the fine-tuned rows (see §20.6 for the full 3-row table format: `ORACLE2D=False` zero-shot + GDino-oracle zero-shot + fine-tuned).
+### 21.4 Known pending work (paper v2)
 
-**Key setup lessons (for the next person, and anyone porting to a new cluster):**
-
-- **Use `pip install groundingdino-py==0.4.0`** — not the github clone (no Python fallback → crashes), not `groundingdino==0.1.0` (CPU-only fallback → 41 s/img, 60× slower). This one detail cost us ~2 hours of CUDA-build debugging this session. §3.1 now calls this out prominently.
-- **Thresholds are domain-specific.** Drone wildlife needs 0.15/0.10 (not GDino's default 0.25/0.25). See §6.4.3 for the reasoning.
-- **Preprocessing must include the resize.** Using a custom `pil_to_tensor + normalize` (no resize) silently produced median-IoU-0.10 boxes. Always call `from groundingdino.util.inference import load_image`. This silent failure mode wasted a full 2.5 h precompute.
-- **Don't chase the CUDA rebuild.** CUDA 12.2+ on this cluster's glibc has an unfixable `cospi`/`sinpi` `noexcept` mismatch. `groundingdino-py`'s Python GPU fallback is within ~10× of the compiled op and perfectly adequate for a one-time 13 k precompute.
-
-### 21.4 Remaining work (do next)
-
-1. **Commit and push the Rel-AP3D fix** (next action — not yet pushed as of this doc update).
-
-2. **Pull on the cluster**:
-   ```bash
-   cd /storage2/3DOM/vshukla/repos/ovmono3d
-   git pull
-   ```
-
-3. **Wipe failed eval outputs** and rerun:
-   ```bash
-   rm -rf output/wildbox_wl5_finetuned_eval \
-          output/wildbox_wl5_finetuned_eval_rel \
-          output/wildbox_wl5_zeroshot_eval
-   ```
-
-4. **Run zero-shot** (skip Rel-AP3D — no in-vocab preds makes scale search meaningless):
-   ```bash
-   tmux new -s wb-zs
-   bash tools/run_full_eval.sh \
-       --weights checkpoints/ovmono3d_lift.pth \
-       --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-       --out     output/wildbox_wl5_zeroshot_eval \
-       --label   "zero-shot (pretrained)" \
-       --gt      datasets/Omni3D/WildBox_val.json \
-       --skip-rel-ap3d
-   ```
-
-5. **Run fine-tuned with Rel-AP3D** (now using the patched per-block scale search — should complete in 15-30 min with progress prints):
-   ```bash
-   tmux new -s wb-ft
-   bash tools/run_full_eval.sh \
-       --weights output/wildbox_wl5_finetune/model_final.pth \
-       --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-       --out     output/wildbox_wl5_finetuned_eval \
-       --label   "fine-tuned (5 species, 11-zip)" \
-       --gt      datasets/Omni3D/WildBox_val.json
-   ```
-
-6. **Build combined report**:
-   ```bash
-   python tools/make_report.py \
-       --run-dir output/wildbox_wl5_zeroshot_eval    --label "zero-shot" \
-       --run-dir output/wildbox_wl5_finetuned_eval   --label "fine-tuned" \
-       --gt      datasets/Omni3D/WildBox_val.json \
-       --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-       --out     output/paper_report_final --compare
-   ```
-
-7. **Paper-figure visualizations**:
-   ```bash
-   python tools/visualize_class_agnostic.py \
-       --preds output/wildbox_wl5_finetune/inference/iter_final/WildBox_val/instances_predictions.pth \
-       --gt    datasets/Omni3D/WildBox_val.json \
-       --out   output/wildbox_wl5_finetune/vis_agnostic \
-       --top-k 3 --every 100 --limit 40
-
-   python tools/visualize_class_agnostic.py \
-       --preds output/wildbox_wl5_zeroshot_eval/inference/iter_final/WildBox_val/instances_predictions.pth \
-       --gt    datasets/Omni3D/WildBox_val.json \
-       --out   output/wildbox_wl5_zeroshot_eval/vis_agnostic \
-       --top-k 3 --every 100 --limit 40
-   ```
-
-### 21.5 Expected final paper numbers (fine-tuned, 11-zip data)
-
-Based on the training-log iter-10000 eval (which used the correct mapping):
-
-| Metric | Micro | Macro | rhino | elephant | zebra | giraffe | gazelle |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 2D AP@0.5 | 90.4 | ~53 | ~82 | ~93 | ~75 | ~60 | ~73 |
-| 3D AP | 16.1 | ~16 | 14.7 | 45.1 | 16.7 | 1.8 | 2.3 |
-| Rel-AP3D | TBD — from step 5 | | | | | | |
-| AP_BEV@0.25 | TBD — from step 5 | | | | | | |
-
-The long-tail classes (giraffe 3D AP 1.8, gazelle 2.3) are the main weakness — motivates REPEAT_THRESHOLD bump to 0.5 for the next run (per §10.3 recommendations).
-
-### 21.6 Known pending
-
-- 3 zips still transferring: `data202401KElephants`, `data202401KRhinos`, `data202602KElephants`. Listed in [datasets/pending_sources.txt](datasets/pending_sources.txt). Retrain from scratch with all 12 once these arrive (§8.1).
-- pytorch3d CUDA rebuild never completed (cluster glibc blocks it). `search_rel_scale` now forces CPU tensors; this is the permanent state unless cluster glibc changes.
-- Giraffe has only 4 videos total (3 train, 1 val). Wide error bars expected; report 2-3 seeds per §10.3.
+- **Zebra species audit** — current split assumes "KABR = Grévy's, all others = plains" based on user knowledge. For paper v1 this is adequate. For paper v2, verify per-video with a domain expert.
+- **Giraffe val is thin** — 1 val video, 110 boxes. Per-class giraffe metrics will have high variance regardless of training-seed variance. Flag in paper limitations section; no fix available without more giraffe videos.
+- **Train/val size mismatch on giraffe** — train median bbox 38k px² vs val median 112k px² (val has closer animals). Known hazard of video-level splits with ≤4 videos per class. Stabilizes as we add more giraffe data.
+- **pytorch3d CUDA build** remains blocked by cluster glibc on CUDA 12.2+. `search_rel_scale` forces CPU tensors — permanent state.
 
 ---
 
