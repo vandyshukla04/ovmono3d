@@ -307,3 +307,4 @@ Copy the LaTeX tables (`table_main.tex`, `table_multiseed.tex`) directly into th
 - **Training crashes at iteration 0 (NaN)**: set `SOLVER.AMP.ENABLED False` as a CLI override.
 - **sbatch job queued too long**: cancel and use step 6a (srun + tmux) instead.
 - **After data re-prep, evaluator errors on unknown `category_id`**: re-run step 3 (symlink wiring) — the old symlinks pointed to wildlife5.
+- **Training silently skipped, all per-class AP ≈ 0, `model_final.pth` byte-identical to pretrained** (the 2026-04-24 bug): check `grep -E "Starting training from iteration" logs/train_seed0.log`. If it says `iteration 116000` (or any large number), the pretrained checkpoint's stored `iteration` field confused the trainer. Fixed in commit f894ab6. Confirm `git log --oneline -3` shows that commit, then retrain. See WILDBOX_EXPERIMENT.md §3.1 for the belt-and-suspenders command to strip the `iteration` field from the pretrained.

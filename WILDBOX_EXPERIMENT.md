@@ -256,6 +256,16 @@ pip install shapely openpyxl   # BEV IoU + xlsx readers
 ### 3.1 Known environment issues
 
 - **pytorch3d CUDA build failure on CUDA 12.x with newer glibc.** The cluster's glibc rejects CUDA's `cospi`/`sinpi` declarations. Workaround already in the code: the Rel-AP3D scale search forces CPU tensors (see `cubercnn/evaluation/omni3d_evaluation.py:search_rel_scale`). CPU `box3d_overlap` works on our pinned commit (055ab3a). Don't try to force `FORCE_CUDA=1` unless you're on a cluster with compatible glibc.
+- **Pretrained checkpoint's `iteration` field silently skipped training** (caught 2026-04-24, commit f894ab6). `ovmono3d_lift.pth` stores `iteration=115999` from Omni3D pre-training. [tools/train_net.py:183](tools/train_net.py#L183) previously read this field unconditionally (regardless of `resume` flag) and set `start_iter=116000`. Any fine-tune with `MAX_ITER<116000` silently exited the training loop with zero iterations — no error, no stack trace, just a `model_final.pth` byte-identical to the pretrained. How to spot: `grep -cE "iter: [0-9]+" log.txt` returns 0, or the single log line `Starting training from iteration 116000 (resume=False)`. Fix in the code now respects `resume=False` → `start_iter=0`; the backup belt-and-suspenders is to strip iteration from the pretrained:
+  ```bash
+  python -c "
+  import torch
+  c = torch.load('checkpoints/ovmono3d_lift.pth', weights_only=False, map_location='cpu')
+  c.pop('iteration', None); c.pop('optimizer', None); c.pop('scheduler', None)
+  torch.save(c, 'checkpoints/ovmono3d_lift.pth')
+  "
+  ```
+  **5-species wildlife5 runs predating this fix happened to start from iter 0** because they didn't CLI-override `MODEL.WEIGHTS` — only the later multi-seed path did, which routed through the bug. Any run launched via `tools/run_multi_seed.sh` pre-f894ab6 is invalid (zero-trained).
 - **GroundingDINO CUDA build also fails** on this cluster (same cospi/sinpi glibc mismatch). **Use `pip install groundingdino-py==0.4.0`** — the PyPI package has a proper GPU Python fallback (~0.7 s/img on A40). Do **not** use the official `IDEA-Research/GroundingDINO` GitHub clone directly (its `ms_deform_attn.py` crashes with `NameError: name '_C' is not defined` when the CUDA op can't load — no fallback). Do **not** use `pip install groundingdino==0.1.0` either — that version's fallback runs on **CPU** (~41 s/img), 60× slower than `groundingdino-py`. See §6.4.3 for the precompute command.
 - **`libGL.so.1: cannot open shared object file`** — appears on CPU-only nodes because `cv2` requires system graphics libs. Run eval on GPU nodes only.
 
