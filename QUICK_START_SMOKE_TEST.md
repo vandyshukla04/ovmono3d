@@ -1,362 +1,391 @@
-# Quick-start smoke test — end-to-end in ~2 hours
+# Quick-start smoke test — end-to-end in ~1 hour
 
-**Purpose:** prove this branch works start-to-finish before committing to a
-multi-hour full training run. Uses **one zip per species** (smallest
-available) and a short 2000-iteration fine-tune. Not a production run —
-numbers will be low, but every pipeline step is exercised.
+**Purpose**: prove the WildBox pipeline works start-to-finish before committing to the multi-hour full training run. Uses **one zip per species (smallest available)** and a short 2 000-iteration fine-tune. Numbers will be low — that's fine. Goal is to exercise every step.
 
-**When to use:** after pulling new code, changing configs, or rewriting
-tools that affect the pipeline. Run this to catch breakage before scaling.
+**Run this**: after pulling new code, changing configs, or porting to a new cluster. Catches breakage before scaling.
 
-**Cluster:** all GPU steps on node81 (A40); CPU steps work anywhere. Env:
-`/storage3/3DOM/vshukla/envs/ovmono3d`.
+**Pipeline this validates**: 6-species data prep → category-meta wiring → dataset stats → zero-shot RPN eval → fine-tune → 5-step full eval (standard / Rel-AP3D / BEV / class-agnostic / OVMono3D-style vis) → paper-results assembly.
+
+**Cluster**: GPU steps on `node81` (A40); env `/storage3/3DOM/vshukla/envs/ovmono3d`. All commands use a fixed `output/smoke/` path so multiple terminals can run side-by-side without env-var coordination.
 
 ---
 
-## 0. Setup (first terminal — ALWAYS run these before anything else)
+## 0. Setup (in tmux on node81)
 
 ```bash
 ssh node81
 conda activate /storage3/3DOM/vshukla/envs/ovmono3d
 cd /storage2/3DOM/vshukla/repos/ovmono3d
 git pull
-mkdir -p output/smoke
+mkdir -p output/smoke logs
+
+# Fresh slate (optional)
+# rm -rf output/smoke && mkdir -p output/smoke
 ```
 
-**All steps below write to `output/smoke/...` — a fixed path.** You can open
-as many additional terminals as you want (for parallel zero-shot + training,
-or monitoring) — just `ssh node81 && cd /storage2/3DOM/vshukla/repos/ovmono3d
-&& conda activate /storage3/3DOM/vshukla/envs/ovmono3d` and paste commands
-from this doc. No env-var setup required.
-
-If you want a clean slate (rerun from scratch):
+**Use tmux** for the training step so it survives ssh disconnect:
 ```bash
-rm -rf output/smoke   # wipe previous smoke outputs
-mkdir -p output/smoke
+tmux new -s smoke   # all commands below run inside this session
 ```
 
-If you want to keep history across smoke runs, rename before restarting:
+---
+
+## 1. Smallest zip per species (6 zips)
+
+| Species | Zip | Notes |
+|---|---|---|
+| giraffe | `data202401KGiraffes` | smaller of 2 giraffe zips |
+| grevys_zebra | `data2023KABRZebras` | only Grévy's-zebra source (KABR reserve) |
+| elephant | `data202406KElephants` | smallest elephant zip |
+| plains_zebra | `data202307KZebras` | smallest plains zebra zip |
+| rhino | `data202502KRhinoCamiV1` | smaller of the rhino zips |
+| gazelle | `data202406KGazelles` | only gazelle source |
+
+If any of these doesn't exist on your cluster, `ls /storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/` and pick another zip of the same species.
+
+---
+
+## 2. Register species in Omni3D stats (idempotent — safe to re-run)
+
 ```bash
-mv output/smoke output/smoke_$(date +%Y%m%d_%H%M%S) && mkdir -p output/smoke
-```
-
-## 1. Smallest available zip per species (picked for speed)
-
-| Species | Zip | Frames | Videos |
-|---|---|---:|---:|
-| rhino | `data202502KRhinoCamiV1` | 5 107 | 4 |
-| elephant | `data202406KElephants` | 3 369 | 4 |
-| zebra | `data2023KABRZebras` | 4 610 | 5 |
-| giraffe | `data202401KGiraffes` | 1 220 | 2 |
-| gazelle | `data202406KGazelles` | 7 443 | 4 |
-| **Total** | | **~21 749** | **~19** |
-
-## 2. Data prep (single-zip-per-species, video-level split, SAM3 tight bboxes)
-
-```bash
-# Make sure wildlife categories are registered in Omni3D stats (idempotent)
 python tools/patch_stats_for_wildbox.py \
     --stats datasets/Omni3D/stats.json \
-    --add rhino:1004 elephant:1002 zebra:1001 giraffe:1000 gazelle:1005
+    --add giraffe:1000 grevys_zebra:1001 elephant:1002 plains_zebra:1003 rhino:1004 gazelle:1005
 
-# Build train/val JSONs (auto-extracts each zip on first run, caches after)
-python tools/prepare_wildbox_dataset.py \
-    --source /storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/data202502KRhinoCamiV1/WildBox_sam3-vggtv1_processed.zip=rhino:1004 \
-    --source /storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/data202406KElephants/WildBox_sam3-vggtv1_processed.zip=elephant:1002 \
-    --source /storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/data2023KABRZebras/WildBox_sam3-vggtv1_processed.zip=zebra:1001 \
-    --source /storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/data202401KGiraffes/WildBox_sam3-vggtv1_processed.zip=giraffe:1000 \
-    --source /storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/data202406KGazelles/WildBox_sam3-vggtv1_processed.zip=gazelle:1005 \
-    --split-mode video --val-fraction 0.2 --seed 0 \
-    --output-train datasets/Omni3D/WildBox_train.json \
-    --output-val   datasets/Omni3D/WildBox_val.json \
-    --dataset-id 1000 -v
-```
-
-**First run takes 5–20 min** (extracts the 5 zips). Subsequent runs reuse
-the `*_unzipped/` sibling dirs and take <1 min.
-
-## 3. Wire up BOTH category_meta symlinks + verify
-
-```bash
-ln -sf wildbox/category_meta_wildlife5.json configs/category_meta.json
-ln -sf category_meta_wildlife5.json         configs/wildbox/category_meta.json
-
-# BOTH must show giraffe first (matching training's sorted-by-dataset-id order)
-cat configs/category_meta.json
-cat configs/wildbox/category_meta.json
-
-# No-leakage + file-exists sanity check
+# Sanity: all 6 must be in stats.json
 python -c "
-import json, os
-from collections import Counter
-for split in ('train','val'):
-    d = json.load(open(f'datasets/Omni3D/WildBox_{split}.json'))
-    cats = Counter(a['category_name'] for a in d['annotations'])
-    vids = {img['file_path'].split('/')[-3] for img in d['images']}
-    missing = sum(1 for img in d['images'][:200] if not os.path.exists(img['file_path']))
-    assert missing == 0, f'{split}: {missing} paths do not resolve'
-    print(f'{split}: {len(d[\"images\"])} imgs, {len(d[\"annotations\"])} anns, '
-          f'{len(vids)} videos, anns_per_class={dict(cats)}')
-train_v = {im['file_path'].split('/')[-3] for im in json.load(open('datasets/Omni3D/WildBox_train.json'))['images']}
-val_v   = {im['file_path'].split('/')[-3] for im in json.load(open('datasets/Omni3D/WildBox_val.json'))['images']}
-ov = len(train_v & val_v)
-assert ov == 0, f'video leakage: {ov} shared videos'
-print(f'OK: {len(train_v)} train vids, {len(val_v)} val vids, no overlap')
+import json
+s = json.load(open('datasets/Omni3D/stats.json'))
+wanted = ['giraffe', 'grevys_zebra', 'elephant', 'plains_zebra', 'rhino', 'gazelle']
+have = s.get('category_names', [])
+missing = [c for c in wanted if c not in have]
+print('missing:', missing if missing else 'none ✓')
 "
 ```
 
-**Abort if any line fails.** Video overlap must be 0.
+---
 
-## 💡 Steps 4 and 5 can run in parallel (different terminals)
+## 3. Build train/val JSONs (video-level split, SAM3 tight bboxes)
 
-Each writes to a **different subdirectory under `output/smoke/`** and the
-zero-shot eval shares the GPU with training very lightly (mostly CPU after
-inference). Do Step 4 in terminal A while Step 5 runs in terminal B.
-
-Open a second terminal:
 ```bash
-ssh node81
-conda activate /storage3/3DOM/vshukla/envs/ovmono3d
-cd /storage2/3DOM/vshukla/repos/ovmono3d
-# no env vars to re-export — the doc uses the fixed output/smoke path
+export ARCHIVE=/storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive
+
+python tools/prepare_wildbox_dataset.py \
+    --source ${ARCHIVE}/data202401KGiraffes/WildBox_sam3-vggtv1_processed.zip=giraffe:1000 \
+    --source ${ARCHIVE}/data2023KABRZebras/WildBox_sam3-vggtv1_processed.zip=grevys_zebra:1001 \
+    --source ${ARCHIVE}/data202406KElephants/WildBox_sam3-vggtv1_processed.zip=elephant:1002 \
+    --source ${ARCHIVE}/data202307KZebras/WildBox_sam3-vggtv1_processed.zip=plains_zebra:1003 \
+    --source ${ARCHIVE}/data202502KRhinoCamiV1/WildBox_sam3-vggtv1_processed.zip=rhino:1004 \
+    --source ${ARCHIVE}/data202406KGazelles/WildBox_sam3-vggtv1_processed.zip=gazelle:1005 \
+    --split-mode video --val-fraction 0.2 --seed 0 \
+    --output-train output/smoke/WildBox_train.json \
+    --output-val   output/smoke/WildBox_val.json \
+    --dataset-id 1000 -v
+
+# Use these (smoke-specific) JSONs for the rest of the smoke
+export GT=output/smoke/WildBox_val.json
 ```
 
-Then paste Step 4 in one and Step 5 in the other.
+**First run takes 5–15 min** (extracts 6 zips). Subsequent runs reuse the cached `*_unzipped/` sibling dirs.
 
-## 4. Zero-shot eval — closed-vocab RPN (ORACLE2D=False, ~5 min)
+---
 
-This is the **stricter** zero-shot baseline: model's own RPN + 2D classifier, no open-vocab help. Fast to run, useful as a supplementary number but not the one the OVMono3D paper reports.
+## 4. Wire up BOTH category_meta symlinks
+
+```bash
+ln -sf wildbox/category_meta_wildlife6.json configs/category_meta.json
+ln -sf category_meta_wildlife6.json         configs/wildbox/category_meta.json
+
+# Both must show the 6-species mapping in the same order
+for p in configs/category_meta.json configs/wildbox/category_meta.json; do
+    echo "=== $p ==="
+    python -c "import json; d=json.load(open('$p')); print(d['thing_classes']); print(d['thing_dataset_id_to_contiguous_id'])"
+done
+# Expect: ['giraffe', 'grevys_zebra', 'elephant', 'plains_zebra', 'rhino', 'gazelle']
+#         {'1000': 0, '1001': 1, '1002': 2, '1003': 3, '1004': 4, '1005': 5}
+```
+
+---
+
+## 5. Generate dataset stats + no-leakage check
+
+```bash
+python tools/dataset_stats.py \
+    --train output/smoke/WildBox_train.json \
+    --val   output/smoke/WildBox_val.json \
+    --out   output/smoke/dataset_stats
+
+cat output/smoke/dataset_stats/dataset_stats.md
+
+# Sanity — no video-level leakage + sampled paths exist
+python - <<'PY'
+import json, os
+train = json.load(open('output/smoke/WildBox_train.json'))
+val   = json.load(open('output/smoke/WildBox_val.json'))
+tv = {im['file_path'].split('/')[-3] for im in train['images']}
+vv = {im['file_path'].split('/')[-3] for im in val['images']}
+assert not (tv & vv), f'video leakage: {tv & vv}'
+print(f"OK: {len(tv)} train vids, {len(vv)} val vids, no overlap")
+print(f"     {len(train['images'])} train frames / {len(val['images'])} val frames")
+
+missing = sum(1 for im in val['images'][::max(1, len(val['images'])//20)][:20]
+              if not os.path.exists(im['file_path']
+                                    if im['file_path'].startswith('/')
+                                    else 'datasets/' + im['file_path']))
+print(f"{missing}/20 sampled paths missing")
+PY
+```
+
+Abort if anything fails. All 6 species should appear in `dataset_stats.md` with non-zero train+val counts.
+
+---
+
+## 6. Zero-shot RPN-transfer eval (~5 min)
 
 ```bash
 bash tools/run_full_eval.sh \
     --weights checkpoints/ovmono3d_lift.pth \
-    --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     "output/smoke/zeroshot" \
-    --label   "zero-shot smoke" \
-    --gt      datasets/Omni3D/WildBox_val.json \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
+    --out     output/smoke/zeroshot_rpn \
+    --label   "smoke zero-shot (RPN-transfer)" \
+    --gt      $GT \
     --skip-rel-ap3d
 ```
 
-**Expected:** near-zero standard AP (closed-vocab pretraining has no
-wildlife classes). Class-agnostic 2D AP in `summary_nhd.txt` should show
-`AP@0.50` in the range 5–25 (proves the RPN transfers).
+Closed-vocab pretrained model on wildlife → expect near-zero per-class AP, but **class-agnostic 2D AP@0.5 ≈ 5–25** in `summary_nhd.txt` (proves the RPN finds animals even with wrong labels).
 
-## 4.5 [Optional] Paper-protocol zero-shot with GDino oracle (~10 min + one-time ~2.5 h precompute)
+`--skip-rel-ap3d` because no in-vocab predictions makes scale search meaningless.
 
-Matches the OVMono3D paper's zero-shot: GroundingDINO text-prompted 2D boxes replace the RPN. Run this if you want the headline zero-shot comparison that's directly comparable to the paper's Table 1 — and to any other architecture evaluated under the same protocol (see [WILDBOX_EXPERIMENT.md §20.6](WILDBOX_EXPERIMENT.md)).
+---
 
-**One-time cost:** precomputing the GDino oracle JSON for 13 k val images takes ~2.5 h on A40. Skip this step on the first smoke if you just want the pipeline to green up fast; come back after you've invested the one-time cost.
+## 7. Short fine-tune (~30 min, 2 000 iters)
 
 ```bash
-# (a) One-time install of the correct GDino package — SEE WILDBOX_EXPERIMENT.md §3.1 FIRST.
-#     Do NOT use the github clone or groundingdino==0.1.0. Must be groundingdino-py.
-pip install --no-cache-dir groundingdino-py==0.4.0
-
-# (b) One-time GDino checkpoint download (~1 GB)
-mkdir -p checkpoints
-test -f checkpoints/groundingdino_swinb_cogcoor.pth || \
-  wget -O checkpoints/groundingdino_swinb_cogcoor.pth \
-    https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
-
-# (c) Smoke — 3 images, should take < 30 s
-python tools/precompute_gdino_oracle.py \
-    --gt       datasets/Omni3D/WildBox_val.json \
-    --out      /tmp/smoke_3.json \
-    --species  rhino elephant zebra giraffe gazelle \
-    --device   cuda \
-    --box-threshold 0.15 --text-threshold 0.10 \
-    --limit    3
-# If per-img > 5 s/img: wrong GDino package installed. Re-check step (a).
-
-# (d) Full precompute (~2.5 h on A40) — one-time, output is reusable forever
-mkdir -p logs
-nohup python tools/precompute_gdino_oracle.py \
-    --gt       datasets/Omni3D/WildBox_val.json \
-    --out      datasets/Omni3D/gdino_WildBox_val_oracle_2d.json \
-    --species  rhino elephant zebra giraffe gazelle \
-    --device   cuda \
-    --box-threshold 0.15 --text-threshold 0.10 \
-    --log-every 100 \
-    > logs/gdino_oracle.log 2>&1 &
-disown
-# tail -f logs/gdino_oracle.log
-
-# (e) Paper-protocol zero-shot eval — reads the oracle JSON from (d)
-bash tools/run_full_eval.sh \
-    --weights checkpoints/ovmono3d_lift.pth \
-    --config  configs/wildbox/OVMono3D_wildbox_wildlife5_oracle2d.yaml \
-    --out     "output/smoke/zeroshot_oracle2d" \
-    --label   "zero-shot (paper protocol)" \
-    --gt      datasets/Omni3D/WildBox_val.json \
-    --skip-rel-ap3d
-```
-
-**Two-row report:** after running both step 4 (`ORACLE2D=False`) and step 4.5 (`ORACLE2D=True`), the make_report command in step 7 can include both as separate rows — see §20.6 for why this is the right way to present the comparison.
-
-## 5. Short fine-tune (~1 hour, 2000 iters)
-
-```bash
-tmux new -s smoke-train
 python tools/train_net.py \
-    --config-file configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
+    --config-file configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
     --num-gpus 1 \
+    MODEL.WEIGHTS checkpoints/ovmono3d_lift.pth \
+    DATASETS.TRAIN '("WildBox_train",)' \
+    DATASETS.TEST  '("WildBox_val",)' \
+    SEED 0 \
+    DATALOADER.REPEAT_THRESHOLD 0.5 \
     SOLVER.IMS_PER_BATCH 8 \
     SOLVER.BASE_LR 0.002 \
     SOLVER.MAX_ITER 2000 \
     SOLVER.STEPS "(1200, 1800)" \
     SOLVER.WARMUP_ITERS 100 \
-    SOLVER.CHECKPOINT_PERIOD 500 \
+    SOLVER.CHECKPOINT_PERIOD 1000 \
     TEST.EVAL_PERIOD 10000 \
-    OUTPUT_DIR "output/smoke/finetune"
-# Ctrl-b d  to detach, tmux attach -t smoke-train to come back
+    OUTPUT_DIR output/smoke/finetune
 ```
 
-`TEST.EVAL_PERIOD 10000 > MAX_ITER` means **no in-loop evals** — saves
-time on the smoke. We eval once at the end in step 6.
+### CRITICAL — verify training actually ran (the 2026-04-24 silent-skip bug)
 
-**Expected:** loss drops from ~1.5 to ~0.4 over 2000 iters. Any NaN =
-AMP instability → rerun with `SOLVER.AMP.ENABLED False`.
+```bash
+grep -E "Starting training from iteration" output/smoke/finetune/log.txt
+# REQUIRED: "Starting training from iteration 0 (resume=False)"
+# If you see "iteration 116000" → the bugfix in commit f894ab6 isn't applied → git pull and retry.
 
-## 6. Fine-tuned eval with Rel-AP3D (~20 min)
+grep -cE "iter: [0-9]+" output/smoke/finetune/log.txt
+# REQUIRED: > 80 (D2 logs every ~20 iters; 2000 iters → ~100 lines)
+# If 0: training was silently skipped. See WILDBOX_EXPERIMENT.md §3.1 for the four red flags.
+```
+
+**Expected loss trajectory**: 1.5–2.0 at iter 100 → 0.6–0.9 by iter 2000. NaN anywhere = AMP instability → re-run with `SOLVER.AMP.ENABLED False`.
+
+---
+
+## 8. Fine-tuned full eval (~10 min, all 5 stages)
 
 ```bash
 bash tools/run_full_eval.sh \
-    --weights "output/smoke/finetune/model_final.pth" \
-    --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     "output/smoke/finetuned_eval" \
-    --label   "fine-tuned smoke" \
-    --gt      datasets/Omni3D/WildBox_val.json
+    --weights output/smoke/finetune/model_final.pth \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
+    --out     output/smoke/finetuned_eval \
+    --label   "smoke fine-tuned" \
+    --gt      $GT
 ```
 
-**Expected:** 2D AP50 in the 40–70 range, 3D AP 5–15, Rel-AP3D similar
-to AP3D (best-scale ≈ 1.0). Per-class numbers show all 5 species
-populated (if only one class is non-zero, symlink bug recurred).
+`run_full_eval.sh` runs 5 steps automatically:
+1. **Standard 2D + 3D AP** — `log.txt`
+2. **Rel-AP3D** (LabelAny3D scale-aligned) — `log.rel.txt`
+3. **BEV AP** — `bev_ap.json`
+4. **Class-agnostic + NHD surrogate** — `summary_nhd.txt`
+5. **OVMono3D-style 2×3 visualizations** — `vis_ovmono3d/img_*.jpg`
 
-## 7. Combined zero-shot vs fine-tuned paper report
+**Expected on smoke (2 000 iters, 6 species)**:
+- 2D AP50 in 30–60 range
+- 3D AP 1–10
+- Rel-AP3D similar to 3D AP (best-scale should be 0.8–1.5 if VGGT scale was learned)
+- All 6 species populated in per-class table — if only 1 is non-zero, **symlink bug recurred** (re-run step 4)
+- NHD-z dominant in disentangled NHD
+
+---
+
+## 9. (Optional) Paper-protocol zero-shot via GDino oracle
+
+Skip this on first smoke; come back after you've invested the one-time precompute. Match the OVMono3D paper's zero-shot Table 1 protocol.
 
 ```bash
-python tools/make_report.py \
-    --run-dir "output/smoke/zeroshot"       --label "zero-shot" \
-    --run-dir "output/smoke/finetuned_eval" --label "fine-tuned" \
-    --gt      datasets/Omni3D/WildBox_val.json \
-    --config  configs/wildbox/OVMono3D_wildbox_wildlife5.yaml \
-    --out     "output/smoke/paper_report" \
-    --compare
+# (a) Install correct GDino package (one-time)
+pip install --no-cache-dir groundingdino-py==0.4.0
+# DO NOT use the github clone or groundingdino==0.1.0 — see WILDBOX_EXPERIMENT.md §3.1.
 
-cat "output/smoke/paper_report/report.md"
+# (b) Download GDino checkpoint (one-time, ~1 GB)
+mkdir -p checkpoints
+test -f checkpoints/groundingdino_swinb_cogcoor.pth || \
+  wget -O checkpoints/groundingdino_swinb_cogcoor.pth \
+    https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
+
+# (c) Smoke 3 images first — should take < 30 s
+python tools/precompute_gdino_oracle.py \
+    --gt       $GT \
+    --out      /tmp/gdino_smoke3.json \
+    --species  rhino elephant plains_zebra grevys_zebra giraffe gazelle \
+    --device   cuda \
+    --box-threshold 0.15 --text-threshold 0.10 \
+    --limit    3
+# If per-img > 5 s/img → wrong package; re-check step (a).
+
+# (d) Full precompute on smoke val (small, ~5-15 min instead of full 2.5h)
+nohup python tools/precompute_gdino_oracle.py \
+    --gt       $GT \
+    --out      output/smoke/gdino_smoke_oracle.json \
+    --species  rhino elephant plains_zebra grevys_zebra giraffe gazelle \
+    --device   cuda \
+    --box-threshold 0.15 --text-threshold 0.10 \
+    --log-every 100 \
+    > logs/smoke_gdino.log 2>&1 &
+disown
+# Wait for it; tail -f logs/smoke_gdino.log
+
+# (e) Oracle zero-shot eval (~10 min)
+# Note: writes the GDino JSON to the canonical location the config expects, OR
+# create a temporary smoke oracle yaml. Easiest: copy the smoke oracle JSON over
+# the canonical path for this run only (back up first if you have a real one):
+test -f datasets/Omni3D/gdino_WildBox_val_oracle_2d.json && \
+  cp datasets/Omni3D/gdino_WildBox_val_oracle_2d.json datasets/Omni3D/gdino_WildBox_val_oracle_2d.json.bak
+cp output/smoke/gdino_smoke_oracle.json datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
+
+bash tools/run_full_eval.sh \
+    --weights checkpoints/ovmono3d_lift.pth \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife6_oracle2d.yaml \
+    --out     output/smoke/zeroshot_oracle \
+    --label   "smoke zero-shot (paper protocol, GDino oracle)" \
+    --gt      $GT \
+    --skip-rel-ap3d
+
+# Restore canonical GDino oracle if it existed
+test -f datasets/Omni3D/gdino_WildBox_val_oracle_2d.json.bak && \
+  mv datasets/Omni3D/gdino_WildBox_val_oracle_2d.json.bak datasets/Omni3D/gdino_WildBox_val_oracle_2d.json
 ```
 
-**Verify:**
-- `Per-class annotation counts` lists all 5 species.
-- Fine-tuned row has non-zero values in every per-class column of 2D AP.
-- NHD-z line is the largest component of overall NHD.
+---
 
-## 8. Paper-figure visualizations (~1 min, 2D + 3D + novel view, with/without grid)
+## 10. Assemble the smoke paper-results sheet (~30 s)
 
 ```bash
-# Fine-tuned
-python tools/visualize_class_agnostic.py \
-    --preds "output/smoke/finetune/inference/iter_final/WildBox_val/instances_predictions.pth" \
-    --gt    datasets/Omni3D/WildBox_val.json \
-    --out   "output/smoke/vis_finetuned" \
-    --top-k 5 --every 50 --limit 20
+python tools/assemble_paper_results.py \
+    --finetuned-seeds output/smoke/finetuned_eval \
+    --zeroshot-rpn    output/smoke/zeroshot_rpn \
+    $([ -d output/smoke/zeroshot_oracle ] && echo "--zeroshot-oracle output/smoke/zeroshot_oracle") \
+    --gt              $GT \
+    --dataset-stats   output/smoke/dataset_stats/dataset_stats.md \
+    --classes         giraffe grevys_zebra elephant plains_zebra rhino gazelle \
+    --out             output/smoke/paper_results.md
 
-# Zero-shot (useful comparison)
-python tools/visualize_class_agnostic.py \
-    --preds "output/smoke/zeroshot/inference/iter_final/WildBox_val/instances_predictions.pth" \
-    --gt    datasets/Omni3D/WildBox_val.json \
-    --out   "output/smoke/vis_zeroshot" \
-    --top-k 5 --every 50 --limit 20
+cat output/smoke/paper_results.md
 ```
 
-Outputs:
-```
-output/smoke/vis_finetuned/
-    img_NNNNNN.jpg         ← 2×3 grid, novel view WITH ground grid
-    img_NNNNNN_nogrid.jpg  ← same layout, novel view WITHOUT grid
-```
+Single markdown with all numbers. **This is what passing the smoke means**: the file exists, has populated metric tables for both runs, includes the dataset facts, and the per-class column has all 6 species.
 
-Each file shows, top-to-bottom:
-- Row 1 (GT):   2D boxes  |  3D wireframes  |  novel view (60° pitch)
-- Row 2 (PRED): same three columns
+---
 
-## 9. Training curves (~5 seconds)
+## 11. Training curves (~5 s)
 
 ```bash
-python tools/plot_training.py "output/smoke/finetune/metrics.json"
-ls "output/smoke/finetune/training_curves.png"
+python tools/plot_training.py output/smoke/finetune/metrics.json
+ls output/smoke/finetune/training_curves.png
 ```
 
-## 10. Final file inventory
+---
+
+## 12. Final inventory
 
 ```bash
-tree -L 2 "output/smoke"
-# or
-find "output/smoke" -maxdepth 3 -type f | sort
+find output/smoke -maxdepth 4 -type f -name "*.json" -o -name "*.pth" -o -name "*.md" -o -name "*.txt" | sort
 ```
 
-**Must exist:**
+**Required artifacts (all must exist)**:
+- `output/smoke/WildBox_{train,val}.json`
+- `output/smoke/dataset_stats/dataset_stats.{md,json,png}`
 - `output/smoke/finetune/model_final.pth`
-- `output/smoke/finetune/inference/iter_final/WildBox_val/instances_predictions.pth`
-- `output/smoke/finetune/metrics.json`
+- `output/smoke/finetune/log.txt` (with `iter: NNN` lines, NOT empty)
 - `output/smoke/finetune/training_curves.png`
-- `output/smoke/zeroshot/summary_nhd.txt`
-- `output/smoke/finetuned_eval/summary_nhd.txt`
-- `output/smoke/finetuned_eval/bev_ap.json`
-- `output/smoke/finetuned_eval/log.txt` (contains all 5 species per-class AP)
-- `output/smoke/finetuned_eval/log.rel.txt` (contains Rel-AP3D)
-- `output/smoke/paper_report/report.md`
-- `output/smoke/paper_report/table_main.tex`
-- `output/smoke/vis_finetuned/img_NNNNNN.jpg` × ≥20
-- `output/smoke/vis_finetuned/img_NNNNNN_nogrid.jpg` × ≥20
+- `output/smoke/zeroshot_rpn/{log.txt,bev_ap.json,summary_nhd.txt,paper_report/report.md,vis_ovmono3d/}`
+- `output/smoke/finetuned_eval/{log.txt,log.rel.txt,bev_ap.json,summary_nhd.txt,paper_report/report.md,vis_ovmono3d/}`
+- `output/smoke/paper_results.md` (the master sheet)
+
+---
 
 ## Timing summary
 
 | Step | Wall clock |
 |---|---:|
-| 2 — prep (first run, includes extractions) | 10–20 min |
-| 2 — prep (cached) | <1 min |
-| 4 — zero-shot eval (`ORACLE2D=False`) | ~5 min |
-| 4.5 — paper-protocol zero-shot precompute (one-time) | ~2.5 h |
-| 4.5 — paper-protocol zero-shot eval (after precompute exists) | ~10 min |
-| 5 — short fine-tune (2000 iters) | ~55 min |
-| 6 — fine-tuned eval + Rel-AP3D | ~20 min |
-| 7-9 — report + vis + plots | ~2 min |
-| **Total (skipping 4.5)** | **~1h 40m** (cached prep), **~2h** (first run) |
-| **Total (first time, incl. 4.5 precompute)** | **~4h 10m** |
-| **Total (4.5 eval only, precompute reused)** | **~1h 50m** |
+| 3 — data prep (first run, includes extraction) | 5–15 min |
+| 3 — data prep (cached) | <1 min |
+| 6 — zero-shot RPN-transfer eval | ~5 min |
+| 7 — short fine-tune (2 000 iters) | ~30 min |
+| 8 — fine-tuned full eval (5 steps) | ~10 min |
+| 10–12 — assembly + curves + inventory | ~1 min |
+| **Total (skipping §9 oracle)** | **~50 min** (cached prep), **~1 h** (first run) |
+| 9 — paper-protocol oracle (one-time precompute) | +~15 min on smoke val |
+| **Total including §9** | **+~25 min** after one-time precompute |
 
 ---
 
-## If any step fails
+## If anything fails
 
-Check these in order:
+In the order most likely to be wrong:
 
-1. **Symlinks**: `cat configs/category_meta.json configs/wildbox/category_meta.json` — both must show `"thing_classes": ["giraffe", "zebra", "elephant", "rhino", "gazelle"]`.
-2. **Env**: `python -c "import torch, pytorch3d, detectron2; from cubercnn.modeling.roi_heads import ROIHeads3D"`.
-3. **Branch**: `git log --oneline -1` — should be at the latest commit on `wildbox_ovmono3d`.
-4. **Data paths**: `ls /storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/*/WildBox_sam3-vggtv*.zip` — all 5 zips must be non-empty.
-5. **Disk space**: `df -h /storage3` — need ~50 GB free for the 5 extracted zips.
+1. **Symlinks (§4 wrong)** — every per-class AP is 0 except one, OR
+   `ValueError: 'plains_zebra' is not in list` from `register_and_store_model_metadata`.
+   Fix: re-run §4 commands. Both `configs/category_meta.json` and `configs/wildbox/category_meta.json` must point to `category_meta_wildlife6.json`.
 
-See [WILDBOX_EXPERIMENT.md §2.8](WILDBOX_EXPERIMENT.md) for the category-
-meta gotcha, [§15.1](WILDBOX_EXPERIMENT.md) for the full pre-flight list,
-and [§21](WILDBOX_EXPERIMENT.md) for the current-state / resume context.
+2. **Stats not patched (§2 skipped)** — `ValueError: 'plains_zebra' is not in list` at training start.
+   Fix: re-run §2.
 
-## What this proves (on a green run)
+3. **Training silently skipped** (§7 fails the `iteration 0` check) — `model_final.pth` is byte-identical to the pretrained, no `iter: NNN` lines in `log.txt`.
+   Fix: `git pull` (must be at commit `f894ab6` or later). See [WILDBOX_EXPERIMENT.md §3.1](WILDBOX_EXPERIMENT.md) for the four red flags.
 
-- Data prep with zip extraction ✓
+4. **NaN training loss** (§7 trajectory) — AMP instability.
+   Fix: add `SOLVER.AMP.ENABLED False` to the §7 command.
+
+5. **Missing zip** (§3 fails) — one of the 6 source zip paths doesn't exist.
+   Fix: `ls /storage3/3DOM/vshukla/sam3/wd_data/wildbox/archive/` and pick a substitute zip of the same species.
+
+6. **Disk space** — extracting 6 zips needs ~30 GB free.
+   Fix: `df -h /storage3` before starting.
+
+For deeper debugging, see [WILDBOX_EXPERIMENT.md §3.1](WILDBOX_EXPERIMENT.md) (env issues), [§21.2](WILDBOX_EXPERIMENT.md) (bugs we caught with diagnostics).
+
+---
+
+## What this smoke proves on a green run
+
+- 6-species data prep with zip extraction + caching ✓
 - SAM3 tight 2D bbox pipeline ✓
-- Video-level splits with deterministic seed ✓
-- Category-meta consistency (both symlinks + stats.json) ✓
-- Zero-shot pipeline — closed-vocab RPN (`ORACLE2D=False`) + class-agnostic eval ✓
-- Zero-shot pipeline — paper protocol (GDino oracle, `ORACLE2D=True`), if step 4.5 run ✓
-- Training loop + AMP + RepeatFactorSampler ✓
-- Standard eval (2D AP, 3D AP) with correct per-class mapping ✓
+- Video-level split with deterministic seed (no leakage) ✓
+- Auto-generated dataset_stats.md (paper-ready inventory) ✓
+- Category_meta consistency (BOTH symlinks point to wildlife6) ✓
+- stats.json registration of all 6 species (including grevys_zebra + plains_zebra) ✓
+- NUM_CLASSES=6 head reinitialization from 50-class pretrained ✓
+- Iteration-skip-training fix (training actually runs) ✓
+- Standard 2D + 3D AP eval with correct class mapping ✓
 - Rel-AP3D per-block scale search ✓
-- BEV AP with dataset-id → contiguous-id mapping ✓
-- Paper report generation (markdown + LaTeX) ✓
-- OVMono3D-style novel-view visualization (with + without ground grid) ✓
+- BEV AP with dataset-id → contiguous-id normalization for both fine-tuned and oracle predictions ✓
+- Class-agnostic 2D AP + NHD diagnostic ✓
+- OVMono3D-style 2×3 visualizations (auto via run_full_eval step 5) ✓
+- Single-sheet paper-results assembly ✓
 
-If this smoke test passes end-to-end, the branch is ready for a full run
-(see WILDBOX_EXPERIMENT.md §15 for the scaled-up playbook with all 12
-zips and 15 000 training iterations).
+Once green, scale up to the full 15-zip run via [FINAL_RUN.md](FINAL_RUN.md).
