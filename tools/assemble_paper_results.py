@@ -166,6 +166,59 @@ def gather_run(run_dir: Path) -> Dict[str, Any]:
     return out
 
 
+def normalize_single_run(r: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrap raw scalar values from a single-seed run as (value, 0.0) tuples
+    so the renderer can treat single-seed and multi-seed rows uniformly.
+
+    Also re-keys the raw BEV JSON ('ap_micro', 'ap_macro', 'ap_per_class')
+    to the post-aggregation shape ('micro', 'macro', 'per_class').
+
+    Returns a NEW dict; doesn't mutate input.
+    """
+    def to_tup(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return (float("nan"), 0.0)
+        if isinstance(v, (int, float)):
+            return (float(v), 0.0)
+        return v  # already a tuple, leave alone
+
+    out = dict(r)
+    out["summary"] = {
+        mode: {k: to_tup(v) for k, v in (r.get("summary", {}).get(mode) or {}).items()}
+        for mode in (r.get("summary") or {})
+    }
+    out["per_class"] = {
+        mode: {
+            cname: {mk: to_tup(mv) for mk, mv in (r.get("per_class", {}).get(mode, {}).get(cname) or {}).items()}
+            for cname in (r.get("per_class", {}).get(mode) or {})
+        }
+        for mode in (r.get("per_class") or {})
+    }
+    out["disent_nhd"] = {k: to_tup(v) for k, v in (r.get("disent_nhd") or {}).items()}
+    out["ca_nhd"] = {k: to_tup(v) for k, v in (r.get("ca_nhd") or {}).items()}
+
+    # BEV: raw json uses ap_micro / ap_macro / ap_per_class with float values.
+    # Aggregator uses micro / macro / per_class with (mean, std) tuples.
+    # Translate raw -> aggregator shape so the renderer can treat both the same.
+    bev_in = r.get("bev") or {}
+    bev_out: Dict[str, Any] = {}
+    for k, v in bev_in.items():
+        # Only iterate the per-IoU dicts (skip top-level scalar keys like 'iou_thresholds')
+        if not isinstance(v, dict):
+            continue
+        if "ap_per_class" not in v and "ap_micro" not in v:
+            # Already in aggregator shape (or unknown); pass through
+            bev_out[k] = v
+            continue
+        bev_out[k] = {
+            "micro": to_tup(v.get("ap_micro")),
+            "macro": to_tup(v.get("ap_macro")),
+            "per_class": {c: to_tup(p) for c, p in (v.get("ap_per_class") or {}).items()},
+        }
+    out["bev"] = bev_out
+    return out
+
+
 # ---------------------------------------------------------------
 # Aggregation across seeds
 # ---------------------------------------------------------------
@@ -272,10 +325,24 @@ def _fmt(mean: float, std: float, force_std: bool = False) -> str:
     return f"{mean:.2f} ± {std:.2f}"
 
 
+def _as_tuple(v) -> Tuple[float, float]:
+    """Coerce a value into (mean, std). Accepts already-tuple, raw scalar,
+    or None/NaN. Single defensive helper that the whole renderer uses."""
+    if v is None:
+        return (float("nan"), 0.0)
+    if isinstance(v, tuple) and len(v) == 2:
+        return (float(v[0]) if v[0] is not None else float("nan"),
+                float(v[1]) if v[1] is not None else 0.0)
+    if isinstance(v, (int, float)):
+        return (float(v), 0.0)
+    return (float("nan"), 0.0)
+
+
 def _cell(getter, agg: Dict[str, Any]) -> str:
     try:
-        m, s = getter(agg)
-        if m is None or (isinstance(m, float) and math.isnan(m)):
+        v = getter(agg)
+        m, s = _as_tuple(v)
+        if math.isnan(m):
             return "—"
         return _fmt(m, s)
     except (KeyError, TypeError, ValueError):
@@ -357,7 +424,7 @@ def render_markdown(rows: List[Dict[str, Any]],
         row = [r["label"]]
         per_cls = []
         for c in classes:
-            m, s = r.get("per_class", {}).get("2D", {}).get(c, {}).get("AP", (float("nan"), 0.0))
+            m, s = _as_tuple(r.get("per_class", {}).get("2D", {}).get(c, {}).get("AP"))
             row.append(_fmt(m, s))
             if not math.isnan(m):
                 per_cls.append(m)
@@ -375,7 +442,7 @@ def render_markdown(rows: List[Dict[str, Any]],
         row = [r["label"]]
         per_cls = []
         for c in classes:
-            m, s = r.get("per_class", {}).get("3D", {}).get(c, {}).get("AP", (float("nan"), 0.0))
+            m, s = _as_tuple(r.get("per_class", {}).get("3D", {}).get(c, {}).get("AP"))
             label = "**" if c in rare_classes else ""
             row.append(label + _fmt(m, s) + label)
             if not math.isnan(m):
@@ -393,17 +460,12 @@ def render_markdown(rows: List[Dict[str, Any]],
         out.append("|" + "|".join(["---"] * (len(classes) + 3)) + "|")
         for r in rows:
             row = [r["label"]]
+            bev_at_iou = r.get("bev", {}).get(iou, {}) or {}
             for c in classes:
-                try:
-                    m, s = r["bev"][iou]["per_class"][c]
-                    row.append(_fmt(m, s))
-                except (KeyError, TypeError):
-                    row.append("—")
-            try:
-                row.append(_fmt(*r["bev"][iou]["micro"]))
-                row.append(_fmt(*r["bev"][iou]["macro"]))
-            except (KeyError, TypeError):
-                row.append("—"); row.append("—")
+                m, s = _as_tuple(bev_at_iou.get("per_class", {}).get(c))
+                row.append(_fmt(m, s))
+            row.append(_fmt(*_as_tuple(bev_at_iou.get("micro"))))
+            row.append(_fmt(*_as_tuple(bev_at_iou.get("macro"))))
             out.append("| " + " | ".join(row) + " |")
     out.append("\n")
 
@@ -414,13 +476,10 @@ def render_markdown(rows: List[Dict[str, Any]],
     out.append("|" + "|".join(["---"] * 6) + "|")
     for r in rows:
         row = [r["label"]]
+        nhd = r.get("disent_nhd", {}) or {}
         for k in ("overall_NHD", "disent_xy_NHD", "disent_z_NHD",
                   "disent_dimensions_NHD", "disent_pose_NHD"):
-            try:
-                m, s = r["disent_nhd"][k]
-                row.append(_fmt(m, s))
-            except (KeyError, TypeError):
-                row.append("—")
+            row.append(_fmt(*_as_tuple(nhd.get(k))))
         out.append("| " + " | ".join(row) + " |")
     out.append("\n")
 
@@ -431,12 +490,9 @@ def render_markdown(rows: List[Dict[str, Any]],
     out.append("|" + "|".join(["---"] * 5) + "|")
     for r in rows:
         row = [r["label"]]
+        ca = r.get("ca_nhd", {}) or {}
         for k in ("ca_2d_ap_0.25", "ca_2d_ap_0.50", "ca_2d_ap_0.75", "ca_macro_2d_ap_0.50"):
-            try:
-                m, s = r["ca_nhd"][k]
-                row.append(_fmt(m, s))
-            except (KeyError, TypeError):
-                row.append("—")
+            row.append(_fmt(*_as_tuple(ca.get(k))))
         out.append("| " + " | ".join(row) + " |")
     out.append("\n")
 
@@ -508,13 +564,12 @@ def render_latex_per_class_3d(rows: List[Dict[str, Any]],
         row = [r["label"]]
         per_cls = []
         for c in classes:
-            try:
-                m, s = r["per_class"]["3D"][c]["AP"]
-                row.append(_fmt(m, s))
-                if not math.isnan(m):
-                    per_cls.append(m)
-            except (KeyError, TypeError):
+            m, s = _as_tuple(r.get("per_class", {}).get("3D", {}).get(c, {}).get("AP"))
+            if math.isnan(m):
                 row.append("--")
+            else:
+                row.append(_fmt(m, s))
+                per_cls.append(m)
         macro = sum(per_cls) / len(per_cls) if per_cls else float("nan")
         row.append(f"{macro:.2f}" if not math.isnan(macro) else "--")
         row_tex = [c.replace("±", r"$\pm$").replace("—", r"--") for c in row]
@@ -579,14 +634,14 @@ def main():
 
     # zero-shot RPN
     if args.zeroshot_rpn and args.zeroshot_rpn.exists():
-        r = gather_run(args.zeroshot_rpn)
+        r = normalize_single_run(gather_run(args.zeroshot_rpn))
         r["label"] = "zero-shot (RPN-transfer, closed-vocab)"
         r["n_seeds"] = 1
         rows.append(r)
 
     # zero-shot GDino oracle
     if args.zeroshot_oracle and args.zeroshot_oracle.exists():
-        r = gather_run(args.zeroshot_oracle)
+        r = normalize_single_run(gather_run(args.zeroshot_oracle))
         r["label"] = "zero-shot (GDino oracle, paper protocol)"
         r["n_seeds"] = 1
         rows.append(r)
@@ -601,7 +656,7 @@ def main():
 
     # ablation rt=0.35
     if args.ablation_rt035 and args.ablation_rt035.exists():
-        r = gather_run(args.ablation_rt035)
+        r = normalize_single_run(gather_run(args.ablation_rt035))
         r["label"] = "ablation: REPEAT_THRESHOLD=0.35 (1 seed)"
         r["n_seeds"] = 1
         rows.append(r)
