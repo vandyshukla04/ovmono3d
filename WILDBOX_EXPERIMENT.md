@@ -491,9 +491,22 @@ In `configs/wildbox/OVMono3D_wildbox_finetune.yaml` (the base): all per-componen
 
 Bird's-eye-view AP at IoU 0.50 (KITTI convention). Why primary, not standard 3D AP:
 - Our domain has VGGT-synthetic depth (median |z|=1) which doesn't align with the pretrained model's metric-scale 3D priors → standard 3D AP underestimates the model's actual 3D quality post-fine-tune.
-- Disentangled NHD shows depth ("z") is the dominant 3D error component. BEV projects out z, isolating the xy + dimensions + yaw quality which our domain can actually evaluate.
+- Disentangled NHD makes the depth bottleneck quantitative: **across all conditions, the z-component dominates 3D error, and the gap between zero-shot and fine-tuned models is 1-2 orders of magnitude larger on z than on any other axis.**
+
+| Condition | NHD-z | NHD-xy | z/xy ratio |
+|---|---:|---:|---:|
+| Fine-tuned (best init5sp) | 5.97 | 2.10 | 2.8× |
+| Fine-tuned (15k 3-seed mean) | 6.37 | 2.12 | 3.0× |
+| Zero-shot RPN-transfer | ~143 | ~46 | 3.1× |
+| Zero-shot GDino oracle | 561 | 46 | 12.2× |
+
+NHD-z reduction from zero-shot to fine-tuned: **~94×** (561 → 6.0). NHD-xy reduction over the same change: ~22× (46 → 2.1). The 4× imbalance — fine-tuning fixes z 4× more aggressively than xy — directly says that **depth error is the limiting axis on this domain**.
+
+BEV AP projects out z entirely, isolating xy + dimensions + pose — the components our domain can evaluate without being dominated by the scale-axis problem. That's the empirical justification for BEV-as-primary on aerial wildlife; not a domain choice but a direct read from the disentangled error decomposition.
 
 `tools/bev_ap_eval.py` computes BEV AP from the saved `instances_predictions.pth` using shapely rotated-rectangle IoU. Reports `micro` (over all preds), `macro` (average per-class), and per-class.
+
+NHD components are reported in units of "GT cuboid extent" — each per-axis error is normalized by the corresponding GT cuboid dimension, so values are scale-invariant and **directly comparable across runs evaluated on the same val set**. Smaller is better; 0 is perfect overlap.
 
 ### 6.2 Per-species aggregation
 
