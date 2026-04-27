@@ -595,198 +595,658 @@ def render_markdown(train: SplitData, val: SplitData, out_path: Path,
 
 # ---------- figure rendering ----------
 
+# Canonical species color palette — used consistently across ALL plots so a
+# reader can follow each species across panels. Hand-picked to be perceptually
+# distinct AND semantically suggestive (giraffe = tan, elephant = gray-blue,
+# rhino = brown, gazelle = warm beige, plains_zebra = light slate, grevys_zebra
+# = dark slate). Falls back gracefully if a class isn't in the dict.
+SPECIES_COLORS = {
+    "giraffe":      "#D4A24C",   # giraffe spots tan
+    "grevys_zebra": "#2C2C3E",   # dark slate (narrow stripes)
+    "elephant":     "#5D7282",   # gray-blue (skin tone)
+    "plains_zebra": "#9AA3AE",   # light slate
+    "rhino":        "#7B4A2A",   # warm brown
+    "gazelle":      "#E8B870",   # warm beige
+}
+SPECIES_FALLBACK = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+                    "#9467bd", "#8c564b", "#e377c2", "#17becf"]
+
+
+def species_color(name: str, fallback_idx: int = 0) -> str:
+    return SPECIES_COLORS.get(name,
+                              SPECIES_FALLBACK[fallback_idx % len(SPECIES_FALLBACK)])
+
+
+def _style_axes(ax, *, grid: bool = True):
+    """Common matplotlib axis polish — flat, no top/right spines, light grid."""
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    if grid:
+        ax.grid(True, axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
+        ax.set_axisbelow(True)
+
+
+def _violin_horizontal(ax, data_per_class, classes, palette,
+                       *, log_x: bool = False, x_label: str = "",
+                       title: str = "", show_means: bool = True,
+                       reference_lines: Optional[List[Tuple[float, str, str]]] = None):
+    """Horizontal violins, one per class, sorted by median ascending.
+    `reference_lines` is a list of (x_value, color, label) for vertical refs."""
+    # Sort classes by median for visual storytelling: low → high
+    valid = [(c, d) for c, d in zip(classes, data_per_class) if d]
+    if not valid:
+        ax.set_axis_off(); return
+    valid.sort(key=lambda kv: statistics.median(kv[1]))
+    sorted_classes = [c for c, _ in valid]
+    sorted_data = [d for _, d in valid]
+
+    positions = list(range(1, len(sorted_classes) + 1))
+    parts = ax.violinplot(sorted_data, positions=positions, vert=False,
+                          showmeans=False, showextrema=False, widths=0.85)
+    for body, c in zip(parts["bodies"], sorted_classes):
+        body.set_facecolor(palette(c))
+        body.set_edgecolor(palette(c))
+        body.set_alpha(0.78)
+
+    # Median markers + count badges
+    for i, (c, d) in enumerate(valid):
+        med = statistics.median(d)
+        ax.scatter([med], [positions[i]], color="white", s=30, zorder=5,
+                   edgecolor="black", linewidths=1.0)
+        if show_means:
+            mean = statistics.mean(d)
+            ax.scatter([mean], [positions[i]], color="black", s=18, marker="d",
+                       zorder=4)
+        # n-badge on right edge
+        ax.annotate(f"n={len(d):,}", xy=(1.0, positions[i]), xycoords=("axes fraction", "data"),
+                    xytext=(-6, 0), textcoords="offset points",
+                    ha="right", va="center", fontsize=8, alpha=0.65)
+
+    if reference_lines:
+        for x, col, lab in reference_lines:
+            ax.axvline(x, color=col, linestyle=":", linewidth=1.2, alpha=0.7, label=lab)
+
+    ax.set_yticks(positions)
+    ax.set_yticklabels(sorted_classes)
+    if log_x:
+        ax.set_xscale("log")
+    ax.set_xlabel(x_label)
+    if title:
+        ax.set_title(title, loc="left", fontsize=11, weight="bold")
+    if reference_lines:
+        ax.legend(loc="lower right", fontsize=8, framealpha=0.7)
+    _style_axes(ax, grid=True)
+    # Lighter horizontal grid since violins are horizontal
+    ax.grid(True, axis="x", alpha=0.25, linestyle="--", linewidth=0.6)
+    ax.set_axisbelow(True)
+
+
 def render_figures(train: SplitData, val: SplitData, fig_dir: Path):
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
+        from matplotlib.patches import Rectangle, Patch
     except ImportError:
         print("  (matplotlib not available; skipping figures)")
         return
 
+    # Apply baseline style for the whole script
+    plt.rcParams.update({
+        "figure.dpi": 120,
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 9,
+        "axes.titleweight": "bold",
+        "axes.titlelocation": "left",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    })
+
     fig_dir.mkdir(parents=True, exist_ok=True)
     classes = sorted({c for c in train.per_species} | {c for c in val.per_species})
+    n_cls = len(classes)
 
-    # 1. species counts (bar chart)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    # Color closure that handles "any class" — preserves order-stability
+    color_for = lambda c: species_color(
+        c, fallback_idx=classes.index(c) if c in classes else 0)
+
+    # =============================================================
+    # Fig 1. species_counts.png — overview dashboard (3 panels)
+    #        Tells the long-tail story up front.
+    # =============================================================
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+
     train_frames = [len(train.per_species[c]["frames"]) for c in classes]
     val_frames = [len(val.per_species[c]["frames"]) for c in classes]
     train_anns = [train.per_species[c]["annotations"] for c in classes]
     val_anns = [val.per_species[c]["annotations"] for c in classes]
-    x = np.arange(len(classes))
-    axes[0].bar(x - 0.2, train_frames, width=0.4, label="train")
-    axes[0].bar(x + 0.2, val_frames, width=0.4, label="val")
-    axes[0].set_xticks(x); axes[0].set_xticklabels(classes, rotation=20)
-    axes[0].set_ylabel("# annotated frames"); axes[0].set_title("Frames per species")
-    axes[0].legend()
-    axes[1].bar(x - 0.2, train_anns, width=0.4, label="train")
-    axes[1].bar(x + 0.2, val_anns, width=0.4, label="val")
-    axes[1].set_xticks(x); axes[1].set_xticklabels(classes, rotation=20)
-    axes[1].set_ylabel("# annotated boxes"); axes[1].set_title("Boxes per species")
-    axes[1].legend()
-    fig.tight_layout(); fig.savefig(fig_dir / "species_counts.png", dpi=120); plt.close(fig)
+    train_vids = [len(train.per_species[c]["videos"]) for c in classes]
+    val_vids = [len(val.per_species[c]["videos"]) for c in classes]
 
-    # 2. bbox pixel area histogram (log scale)
-    cols = 3
-    rows = (len(classes) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), squeeze=False)
-    for i, c in enumerate(classes):
-        ax = axes[i // cols][i % cols]
-        merged = train.per_species[c]["pixel_areas"] + val.per_species[c]["pixel_areas"]
-        merged = [v for v in merged if v > 0]
-        if not merged:
-            ax.set_axis_off(); continue
-        ax.hist(merged, bins=40, edgecolor="k", alpha=0.85)
-        ax.set_xscale("log"); ax.set_xlabel("bbox pixel area (px²)")
-        ax.set_ylabel("count"); ax.set_title(f"{c} (n={len(merged)})")
-    for j in range(len(classes), rows * cols):
-        axes[j // cols][j % cols].set_axis_off()
-    fig.tight_layout(); fig.savefig(fig_dir / "bbox_pixel_area.png", dpi=120); plt.close(fig)
+    pos = np.arange(n_cls)
+    bar_colors = [color_for(c) for c in classes]
 
-    # 3. bbox area as fraction of image
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), squeeze=False)
-    for i, c in enumerate(classes):
-        ax = axes[i // cols][i % cols]
-        merged = [r * 100 for r in
-                  (train.per_species[c]["area_ratios"] + val.per_species[c]["area_ratios"])
-                  if r > 0]
-        if not merged:
-            ax.set_axis_off(); continue
-        ax.hist(merged, bins=40, edgecolor="k", alpha=0.85)
-        ax.set_xscale("log"); ax.set_xlabel("bbox area / image area (%)")
-        ax.set_ylabel("count"); ax.set_title(f"{c} (n={len(merged)})")
-    for j in range(len(classes), rows * cols):
-        axes[j // cols][j % cols].set_axis_off()
-    fig.tight_layout(); fig.savefig(fig_dir / "bbox_area_ratio.png", dpi=120); plt.close(fig)
+    # (a) Frames stacked
+    axes[0].bar(pos, train_frames, color=bar_colors, edgecolor="white", label="train", alpha=0.95)
+    axes[0].bar(pos, val_frames, bottom=train_frames, color=bar_colors,
+                edgecolor="white", hatch="///", alpha=0.55, label="val")
+    axes[0].set_xticks(pos); axes[0].set_xticklabels(classes, rotation=20, ha="right")
+    axes[0].set_ylabel("annotated frames")
+    axes[0].set_title("(a)  Frames per species (train + val stacked)")
+    axes[0].legend(loc="upper left", fontsize=9)
+    _style_axes(axes[0])
+    for i, (t, v) in enumerate(zip(train_frames, val_frames)):
+        axes[0].text(pos[i], t + v + max(train_frames + val_frames) * 0.01,
+                     f"{t+v:,}", ha="center", va="bottom", fontsize=8)
 
-    # 4. aspect ratio histogram
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), squeeze=False)
-    for i, c in enumerate(classes):
-        ax = axes[i // cols][i % cols]
-        merged = train.per_species[c]["aspect_ratios"] + val.per_species[c]["aspect_ratios"]
-        if not merged:
-            ax.set_axis_off(); continue
-        ax.hist(merged, bins=40, edgecolor="k", alpha=0.85, range=(0, 5))
-        ax.axvline(1.0, color="r", linestyle="--", alpha=0.6, label="square (w=h)")
-        ax.set_xlabel("aspect ratio (w/h)"); ax.set_ylabel("count")
-        ax.set_title(f"{c} (n={len(merged)})"); ax.legend(fontsize=8)
-    for j in range(len(classes), rows * cols):
-        axes[j // cols][j % cols].set_axis_off()
-    fig.tight_layout(); fig.savefig(fig_dir / "bbox_aspect_ratio.png", dpi=120); plt.close(fig)
+    # (b) Boxes log-scale (long-tail dramatic)
+    totals_box = [t + v for t, v in zip(train_anns, val_anns)]
+    axes[1].bar(pos, totals_box, color=bar_colors, edgecolor="white")
+    axes[1].set_xticks(pos); axes[1].set_xticklabels(classes, rotation=20, ha="right")
+    axes[1].set_ylabel("annotated boxes (log scale)")
+    axes[1].set_yscale("log")
+    axes[1].set_title("(b)  Boxes per species — log scale exposes the long tail")
+    _style_axes(axes[1])
+    for i, t in enumerate(totals_box):
+        axes[1].text(pos[i], t * 1.08, f"{t:,}", ha="center", va="bottom", fontsize=8)
 
-    # 5. depth (z) distribution
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), squeeze=False)
-    for i, c in enumerate(classes):
-        ax = axes[i // cols][i % cols]
-        merged = train.per_species[c]["depths_z"] + val.per_species[c]["depths_z"]
-        if not merged:
-            ax.text(0.5, 0.5, f"{c}: no z data", ha="center", va="center",
-                    transform=ax.transAxes); ax.set_axis_off(); continue
-        ax.hist(merged, bins=40, edgecolor="k", alpha=0.85)
-        ax.axvline(1.0, color="r", linestyle="--", alpha=0.6, label="VGGT median z=1")
-        ax.set_xlabel("depth z (synthetic units)"); ax.set_ylabel("count")
-        ax.set_title(f"{c} (n={len(merged)})"); ax.legend(fontsize=8)
-    for j in range(len(classes), rows * cols):
-        axes[j // cols][j % cols].set_axis_off()
-    fig.tight_layout(); fig.savefig(fig_dir / "depth_distribution.png", dpi=120); plt.close(fig)
+    # (c) Videos with rare-class hatching
+    axes[2].bar(pos, train_vids, color=bar_colors, edgecolor="white", label="train")
+    axes[2].bar(pos, val_vids, bottom=train_vids, color=bar_colors, alpha=0.55,
+                edgecolor="white", hatch="///", label="val")
+    axes[2].set_xticks(pos); axes[2].set_xticklabels(classes, rotation=20, ha="right")
+    axes[2].set_ylabel("source videos")
+    axes[2].set_title("(c)  Videos per species — bottleneck on rare-class generalization")
+    axes[2].legend(loc="upper left", fontsize=9)
+    axes[2].axhline(5, color="red", linestyle=":", linewidth=1.2, alpha=0.6,
+                    label="rare-class line (≤5 train vids)")
+    _style_axes(axes[2])
+    for i, (t, v) in enumerate(zip(train_vids, val_vids)):
+        if t <= 5:
+            axes[2].annotate("rare", xy=(pos[i], t + v), xytext=(0, 5),
+                             textcoords="offset points", ha="center",
+                             fontsize=8, color="red", weight="bold")
 
-    # 6. dimensions: 3 subplots (W, H, L) per species
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8))
-    for i, axis in enumerate(("dim_W", "dim_H", "dim_L")):
-        data = []
-        for c in classes:
-            merged = train.per_species[c][axis] + val.per_species[c][axis]
-            if merged:
-                data.append((c, merged))
-        if data:
-            for c, vs in data:
-                axes[i].hist(vs, bins=40, alpha=0.5, label=c)
-        axes[i].set_xlabel(f"{axis.replace('dim_', '')} (synthetic units)")
-        axes[i].set_ylabel("count")
-        axes[i].set_title(f"3D dimension: {axis.replace('dim_', '')}")
-        axes[i].legend(fontsize=8)
-    fig.tight_layout(); fig.savefig(fig_dir / "dimensions.png", dpi=120); plt.close(fig)
+    fig.suptitle("Dataset composition — long-tail species distribution typical of wildlife domains",
+                 fontsize=13, weight="bold", y=1.02)
+    fig.tight_layout(); fig.savefig(fig_dir / "species_counts.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
 
-    # 7. boxes per frame
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), squeeze=False)
-    for i, c in enumerate(classes):
-        ax = axes[i // cols][i % cols]
-        merged = (list(train.per_species[c]["boxes_per_frame"].values()) +
-                  list(val.per_species[c]["boxes_per_frame"].values()))
-        if not merged:
-            ax.set_axis_off(); continue
-        ax.hist(merged, bins=range(0, max(merged) + 2), edgecolor="k", alpha=0.85)
-        ax.set_xlabel("boxes per frame"); ax.set_ylabel("frame count")
-        ax.set_title(f"{c} (median {statistics.median(merged):.0f}, max {max(merged)})")
-    for j in range(len(classes), rows * cols):
-        axes[j // cols][j % cols].set_axis_off()
-    fig.tight_layout(); fig.savefig(fig_dir / "boxes_per_frame.png", dpi=120); plt.close(fig)
+    # =============================================================
+    # Fig 2. bbox_pixel_area.png — sorted horizontal violins
+    #        Highlights small-object regime where it lives.
+    # =============================================================
+    fig, ax = plt.subplots(figsize=(11, 0.9 * n_cls + 1.5))
+    data = [(train.per_species[c]["pixel_areas"] + val.per_species[c]["pixel_areas"])
+            for c in classes]
+    refs = [
+        (32 * 32,  "#cc4444", "small-obj limit (32×32 px)"),
+        (96 * 96,  "#cc8844", "medium-obj limit (96×96 px)"),
+    ]
+    _violin_horizontal(
+        ax, data, classes, color_for,
+        log_x=True, x_label="bounding-box pixel area (log px²)",
+        title="Bounding-box size — gazelle and grevys_zebra dominate the small-object regime",
+        reference_lines=refs)
+    ax.text(0.01, 0.97,
+            "● = median   ◆ = mean   |   sorted by median (small → large)",
+            transform=ax.transAxes, fontsize=9, va="top", alpha=0.65)
+    fig.tight_layout(); fig.savefig(fig_dir / "bbox_pixel_area.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
 
-    # 8. co-occurrence heatmap
-    cooc = np.zeros((len(classes), len(classes)), dtype=int)
+    # =============================================================
+    # Fig 3. bbox_area_ratio.png — area-as-fraction violins with semantic zones
+    # =============================================================
+    fig, ax = plt.subplots(figsize=(11, 0.9 * n_cls + 1.5))
+    data = [[r * 100 for r in (train.per_species[c]["area_ratios"] +
+                               val.per_species[c]["area_ratios"]) if r > 0]
+            for c in classes]
+    refs = [
+        (0.1, "#cc4444", "0.1 % image area"),
+        (1.0, "#cc8844", "1.0 % image area"),
+        (10.0, "#cccc44", "10 % image area"),
+    ]
+    _violin_horizontal(
+        ax, data, classes, color_for,
+        log_x=True, x_label="bbox area as % of image (log scale)",
+        title="Object size relative to image — drone altitude shapes the size distribution",
+        reference_lines=refs)
+    fig.tight_layout(); fig.savefig(fig_dir / "bbox_area_ratio.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Fig 4. bbox_aspect_ratio.png — square reference at w/h=1
+    # =============================================================
+    fig, ax = plt.subplots(figsize=(11, 0.9 * n_cls + 1.5))
+    data = [(train.per_species[c]["aspect_ratios"] + val.per_species[c]["aspect_ratios"])
+            for c in classes]
+    refs = [(1.0, "#444444", "square (w=h)")]
+    _violin_horizontal(
+        ax, data, classes, color_for,
+        log_x=False, x_label="aspect ratio (width / height)",
+        title="Bbox aspect ratios — body shape signal: giraffes are tall (<1), elephants wide (>1)",
+        reference_lines=refs)
+    ax.set_xlim(0, 4)
+    # Annotation zones
+    ax.text(0.5, 0.95, "← TALLER", transform=ax.transAxes, fontsize=9,
+            color="#666", alpha=0.6, ha="center")
+    ax.text(0.95, 0.95, "WIDER →", transform=ax.transAxes, fontsize=9,
+            color="#666", alpha=0.6, ha="right")
+    fig.tight_layout(); fig.savefig(fig_dir / "bbox_aspect_ratio.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Fig 5. depth_distribution.png — VGGT-scale clustered around 1.0
+    # =============================================================
+    fig, ax = plt.subplots(figsize=(11, 0.9 * n_cls + 1.5))
+    data = [(train.per_species[c]["depths_z"] + val.per_species[c]["depths_z"])
+            for c in classes]
+    refs = [(1.0, "#cc4444", "VGGT median |z| = 1 (per-segment normalization anchor)")]
+    _violin_horizontal(
+        ax, data, classes, color_for,
+        log_x=False, x_label="camera-frame depth z (synthetic units)",
+        title="Per-segment scale-normalized depth — distributions concentrate around z=1 by construction",
+        reference_lines=refs)
+    fig.tight_layout(); fig.savefig(fig_dir / "depth_distribution.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Fig 6. dimensions.png — 3-panel side-by-side body shape
+    # =============================================================
+    fig, axes = plt.subplots(1, 3, figsize=(15, max(4, 0.7 * n_cls + 1.5)))
+    axes_titles = [
+        ("dim_W", "(a) Width (W)", "narrow ← W → broad"),
+        ("dim_H", "(b) Height (H)", "short ← H → tall"),
+        ("dim_L", "(c) Length (L)", "short ← L → long"),
+    ]
+    for i, (key, title, side) in enumerate(axes_titles):
+        ax = axes[i]
+        data = [(train.per_species[c][key] + val.per_species[c][key])
+                for c in classes]
+        _violin_horizontal(ax, data, classes, color_for,
+                           log_x=False, x_label=f"{key.replace('dim_', '')} (synth. units)",
+                           title=title)
+        # Side annotation
+        ax.text(0.5, -0.18, side, transform=ax.transAxes, fontsize=9,
+                color="#666", ha="center")
+    fig.suptitle("3D dimensions per species — body-shape fingerprints (Omni3D ordering W, H, L)",
+                 fontsize=13, weight="bold", y=1.02)
+    fig.tight_layout(); fig.savefig(fig_dir / "dimensions.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Fig 7. boxes_per_frame.png — scene-density violins
+    # =============================================================
+    fig, ax = plt.subplots(figsize=(11, 0.9 * n_cls + 1.5))
+    data = [(list(train.per_species[c]["boxes_per_frame"].values()) +
+             list(val.per_species[c]["boxes_per_frame"].values()))
+            for c in classes]
+    refs = [
+        (1, "#999999", "1 (sparse)"),
+        (5, "#cc8844", "5 (group)"),
+        (10, "#cc4444", "10 (dense herd)"),
+    ]
+    _violin_horizontal(
+        ax, data, classes, color_for,
+        log_x=False, x_label="boxes per annotated frame",
+        title="Scene density — group/herd vs solo: dense scenes concentrate the depth-bottleneck error",
+        reference_lines=refs)
+    fig.tight_layout(); fig.savefig(fig_dir / "boxes_per_frame.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Fig 8. cooccurrence.png — two-panel: raw + conditional probability
+    # =============================================================
+    cooc = np.zeros((n_cls, n_cls), dtype=int)
     for split in (train, val):
         for sset in split.frame_species.values():
             for a in sset:
                 for b in sset:
                     cooc[classes.index(a)][classes.index(b)] += 1
-    fig, ax = plt.subplots(figsize=(7, 6))
-    # Off-diagonal log scale, diagonal raw counts
-    im = ax.imshow(np.log1p(cooc), cmap="viridis", aspect="auto")
-    ax.set_xticks(range(len(classes))); ax.set_xticklabels(classes, rotation=30, ha="right")
-    ax.set_yticks(range(len(classes))); ax.set_yticklabels(classes)
-    for i in range(len(classes)):
-        for j in range(len(classes)):
-            ax.text(j, i, str(cooc[i][j]), ha="center", va="center",
-                    color="white" if cooc[i][j] > 0 else "black", fontsize=7)
-    ax.set_title("Class co-occurrence (frames containing both)\n(log1p color scale; cell value = raw count)")
-    fig.colorbar(im, ax=ax, label="log1p(frame count)")
-    fig.tight_layout(); fig.savefig(fig_dir / "cooccurrence.png", dpi=120); plt.close(fig)
+    # Conditional: P(B in frame | A in frame) = cooc[A,B] / cooc[A,A]
+    cond = np.where(cooc.diagonal()[:, None] > 0,
+                    cooc / np.maximum(cooc.diagonal()[:, None], 1),
+                    0.0)
 
-    # 9. position bias heatmap (per species)
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), squeeze=False)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+    # (a) raw counts (log-color)
+    im0 = axes[0].imshow(np.log1p(cooc), cmap="viridis", aspect="auto")
+    axes[0].set_xticks(range(n_cls)); axes[0].set_xticklabels(classes, rotation=30, ha="right")
+    axes[0].set_yticks(range(n_cls)); axes[0].set_yticklabels(classes)
+    for i in range(n_cls):
+        for j in range(n_cls):
+            v = cooc[i][j]
+            color = "white" if np.log1p(v) > np.log1p(cooc.max()) * 0.55 else "black"
+            axes[0].text(j, i, f"{v:,}", ha="center", va="center", color=color, fontsize=8)
+    axes[0].set_title("(a) Co-occurrence — frames containing both species (log color)")
+    fig.colorbar(im0, ax=axes[0], label="log1p(frame count)", fraction=0.04)
+
+    # (b) conditional probability — interpretable for ecology audience
+    im1 = axes[1].imshow(cond, cmap="rocket_r" if "rocket_r" in plt.colormaps() else "magma",
+                         aspect="auto", vmin=0, vmax=1)
+    axes[1].set_xticks(range(n_cls)); axes[1].set_xticklabels(classes, rotation=30, ha="right")
+    axes[1].set_yticks(range(n_cls)); axes[1].set_yticklabels(classes)
+    for i in range(n_cls):
+        for j in range(n_cls):
+            v = cond[i][j]
+            if v < 0.005:
+                continue
+            color = "white" if v > 0.5 else "black"
+            axes[1].text(j, i, f"{v*100:.0f}%", ha="center", va="center",
+                         color=color, fontsize=8)
+    axes[1].set_title("(b) P(column species in frame | row species in frame)")
+    axes[1].set_xlabel("co-occurring species")
+    axes[1].set_ylabel("conditional on row species present")
+    fig.colorbar(im1, ax=axes[1], label="conditional probability", fraction=0.04)
+
+    fig.suptitle(
+        "Class co-occurrence — almost all frames are single-species "
+        "(diagonal-dominant); inter-species mixing is rare in drone footage",
+        fontsize=13, weight="bold", y=1.02)
+    fig.tight_layout(); fig.savefig(fig_dir / "cooccurrence.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Fig 9. position_bias.png — per-species heatmaps with image-frame overlay
+    # =============================================================
+    cols = 3
+    rows = (n_cls + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.5 * rows), squeeze=False)
     for i, c in enumerate(classes):
         ax = axes[i // cols][i % cols]
         merged = (train.per_species[c]["centers_xy_norm"] +
                   val.per_species[c]["centers_xy_norm"])
         if not merged:
             ax.set_axis_off(); continue
-        cx = [p[0] for p in merged]; cy = [p[1] for p in merged]
-        ax.hist2d(cx, cy, bins=30, range=[[0, 1], [0, 1]], cmap="hot")
-        ax.invert_yaxis()  # image-coord origin is top-left
-        ax.set_xlabel("normalized cx (image x)"); ax.set_ylabel("normalized cy (image y)")
-        ax.set_title(f"{c} (n={len(merged)}) — bbox centers")
-    for j in range(len(classes), rows * cols):
+        cx = np.array([p[0] for p in merged])
+        cy = np.array([p[1] for p in merged])
+        h = ax.hist2d(cx, cy, bins=24, range=[[0, 1], [0, 1]],
+                       cmap="rocket_r" if "rocket_r" in plt.colormaps() else "magma",
+                       cmin=1)
+        # image frame outline
+        ax.add_patch(Rectangle((0, 0), 1, 1, linewidth=1.2, edgecolor="black",
+                               facecolor="none", alpha=0.6))
+        # centroid marker
+        ax.scatter([cx.mean()], [cy.mean()], s=50, marker="x",
+                   color=color_for(c), linewidths=2.5,
+                   label=f"{c} centroid", zorder=5)
+        ax.invert_yaxis()  # image-coord origin top-left
+        ax.set_xlim(-0.05, 1.05); ax.set_ylim(1.05, -0.05)
+        ax.set_xlabel("normalized image x"); ax.set_ylabel("normalized image y")
+        ax.set_title(f"{c}  (n = {len(merged):,})", fontsize=10,
+                     color=color_for(c), weight="bold")
+        ax.legend(loc="lower right", fontsize=8, framealpha=0.7)
+        ax.set_aspect("equal")
+    for j in range(n_cls, rows * cols):
         axes[j // cols][j % cols].set_axis_off()
-    fig.tight_layout(); fig.savefig(fig_dir / "position_bias.png", dpi=120); plt.close(fig)
+    fig.suptitle("Where do animals appear in the frame? — drone perspective biases per species",
+                 fontsize=13, weight="bold", y=1.005)
+    fig.tight_layout(); fig.savefig(fig_dir / "position_bias.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
 
-    # 10. frames per video
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    fpv_train = [len(fs) for fs in train.video_to_frames.values()]
-    fpv_val = [len(fs) for fs in val.video_to_frames.values()]
-    if fpv_train:
-        axes[0].hist(fpv_train, bins=20, edgecolor="k", alpha=0.85)
-        axes[0].set_title(f"frames per video — train ({len(fpv_train)} videos)")
-        axes[0].set_xlabel("frame count"); axes[0].set_ylabel("video count")
-    if fpv_val:
-        axes[1].hist(fpv_val, bins=20, edgecolor="k", alpha=0.85, color="orange")
-        axes[1].set_title(f"frames per video — val ({len(fpv_val)} videos)")
-        axes[1].set_xlabel("frame count"); axes[1].set_ylabel("video count")
-    fig.tight_layout(); fig.savefig(fig_dir / "frames_per_video.png", dpi=120); plt.close(fig)
+    # =============================================================
+    # Fig 10. video_segment_distribution.png — combined 4-panel
+    # =============================================================
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
 
-    # 11. frames per segment
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    fps_train = [len(fs) for fs in train.segment_to_frames.values()]
-    fps_val = [len(fs) for fs in val.segment_to_frames.values()]
-    if fps_train:
-        axes[0].hist(fps_train, bins=30, edgecolor="k", alpha=0.85)
-        axes[0].set_title(f"frames per segment — train ({len(fps_train)} segments)")
-        axes[0].set_xlabel("frame count"); axes[0].set_ylabel("segment count")
-    if fps_val:
-        axes[1].hist(fps_val, bins=30, edgecolor="k", alpha=0.85, color="orange")
-        axes[1].set_title(f"frames per segment — val ({len(fps_val)} segments)")
-        axes[1].set_xlabel("frame count"); axes[1].set_ylabel("segment count")
-    fig.tight_layout(); fig.savefig(fig_dir / "frames_per_segment.png", dpi=120); plt.close(fig)
+    # (a) frames per video
+    fpv_train = sorted([len(fs) for fs in train.video_to_frames.values()])
+    fpv_val = sorted([len(fs) for fs in val.video_to_frames.values()])
+    if fpv_train + fpv_val:
+        bins = np.logspace(np.log10(max(1, min(fpv_train + fpv_val))),
+                           np.log10(max(fpv_train + fpv_val) + 1), 25)
+        axes[0, 0].hist([fpv_train, fpv_val], bins=bins, label=["train", "val"],
+                        color=["#3a86b8", "#e89742"], edgecolor="white", stacked=False)
+        axes[0, 0].set_xscale("log")
+        axes[0, 0].set_xlabel("frames per video (log)")
+        axes[0, 0].set_ylabel("video count")
+        axes[0, 0].set_title("(a) Video duration: train vs val")
+        axes[0, 0].legend(fontsize=9, loc="upper left")
+        # Median markers
+        if fpv_train:
+            axes[0, 0].axvline(np.median(fpv_train), color="#3a86b8",
+                               linestyle="--", linewidth=1.5, alpha=0.7)
+        if fpv_val:
+            axes[0, 0].axvline(np.median(fpv_val), color="#e89742",
+                               linestyle="--", linewidth=1.5, alpha=0.7)
+    _style_axes(axes[0, 0])
+
+    # (b) segments per video
+    spv_train = [len(s) for s in train.video_to_segments.values()]
+    spv_val = [len(s) for s in val.video_to_segments.values()]
+    if spv_train + spv_val:
+        all_segs = spv_train + spv_val
+        bins = np.arange(0, max(all_segs) + 2)
+        axes[0, 1].hist([spv_train, spv_val], bins=bins, label=["train", "val"],
+                        color=["#3a86b8", "#e89742"], edgecolor="white")
+        axes[0, 1].set_xlabel("segments per video")
+        axes[0, 1].set_ylabel("video count")
+        axes[0, 1].set_title("(b) Segments per video — multiple sub-clips per recording")
+        axes[0, 1].legend(fontsize=9, loc="upper right")
+    _style_axes(axes[0, 1])
+
+    # (c) frames per segment
+    fps_train = sorted([len(fs) for fs in train.segment_to_frames.values()])
+    fps_val = sorted([len(fs) for fs in val.segment_to_frames.values()])
+    if fps_train + fps_val:
+        bins = np.logspace(np.log10(max(1, min(fps_train + fps_val))),
+                           np.log10(max(fps_train + fps_val) + 1), 30)
+        axes[1, 0].hist([fps_train, fps_val], bins=bins, label=["train", "val"],
+                        color=["#3a86b8", "#e89742"], edgecolor="white")
+        axes[1, 0].set_xscale("log")
+        axes[1, 0].set_xlabel("frames per segment (log)")
+        axes[1, 0].set_ylabel("segment count")
+        axes[1, 0].set_title("(c) Segment duration: contiguous-frame chunks for tracking")
+        axes[1, 0].legend(fontsize=9, loc="upper left")
+    _style_axes(axes[1, 0])
+
+    # (d) Top-10 longest videos
+    all_vid_frames = collections.Counter()
+    video_split = {}
+    for split, label in ((train, "train"), (val, "val")):
+        for vid, frames in split.video_to_frames.items():
+            all_vid_frames[vid] += len(frames)
+            video_split[vid] = label
+    top10 = all_vid_frames.most_common(10)
+    if top10:
+        names = [v[0] for v in top10][::-1]
+        counts = [v[1] for v in top10][::-1]
+        cols_v = [("#3a86b8" if video_split[v[0]] == "train" else "#e89742")
+                  for v in top10][::-1]
+        axes[1, 1].barh(range(len(names)), counts, color=cols_v, edgecolor="white")
+        axes[1, 1].set_yticks(range(len(names)))
+        # Truncate long video names
+        labels_short = [(n if len(n) <= 28 else n[:25] + "...") for n in names]
+        axes[1, 1].set_yticklabels(labels_short, fontsize=8)
+        axes[1, 1].set_xlabel("frame count")
+        axes[1, 1].set_title("(d) Top 10 longest videos (color = train / val)")
+        for i, c in enumerate(counts):
+            axes[1, 1].text(c, i, f"  {c:,}", va="center", fontsize=8)
+    _style_axes(axes[1, 1])
+
+    fig.suptitle("Video / segment / frame breakdown — duration is heavy-tailed across the corpus",
+                 fontsize=13, weight="bold", y=1.005)
+    fig.tight_layout(); fig.savefig(fig_dir / "video_segment_distribution.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Fig 11 (NEW): bbox_size_vs_depth.png — the "small-and-far" story
+    #        Log-log scatter of pixel area vs depth, colored per species.
+    #        Single most striking figure: shows that small-bbox + large-depth
+    #        is the regime, and per-species clusters tell apart the species.
+    # =============================================================
+    fig, ax = plt.subplots(figsize=(10, 7))
+    handles = []
+    for c in classes:
+        depths = (train.per_species[c]["depths_z"] +
+                  val.per_species[c]["depths_z"])
+        areas = (train.per_species[c]["pixel_areas"] +
+                 val.per_species[c]["pixel_areas"])
+        if not depths or not areas:
+            continue
+        # Subsample if very large for readability
+        n = min(len(depths), len(areas))
+        depths = depths[:n]; areas = areas[:n]
+        if n > 4000:
+            stride = n // 4000
+            depths = depths[::stride]; areas = areas[::stride]
+        col = color_for(c)
+        ax.scatter(depths, areas, s=8, alpha=0.35, color=col,
+                   edgecolors="none", label=c)
+        # Centroid
+        med_d = statistics.median(depths)
+        med_a = statistics.median(areas)
+        ax.scatter([med_d], [med_a], marker="X", s=240, color=col,
+                   edgecolors="black", linewidths=1.4, zorder=5)
+    ax.set_xlabel("camera-frame depth z (synthetic units, per-segment median = 1)")
+    ax.set_ylabel("bbox pixel area  (px²)")
+    ax.set_yscale("log")
+    ax.set_title("Bbox size vs. depth — closer animals subtend larger pixel area "
+                 "(× = per-species median)", loc="left", fontsize=12, weight="bold")
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.75, markerscale=2.0)
+    _style_axes(ax)
+    ax.grid(True, which="both", axis="both", alpha=0.2, linestyle="--", linewidth=0.5)
+    fig.tight_layout(); fig.savefig(fig_dir / "bbox_size_vs_depth.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Fig 12 (NEW): species_dashboard.png — one-page TL;DR
+    #        Single figure for talks, abstract figures, the
+    #        "everything at a glance" panel of the dataset paper.
+    # =============================================================
+    fig = plt.figure(figsize=(15, 10))
+    gs = fig.add_gridspec(3, 4, height_ratios=[0.6, 1.4, 1.4],
+                          width_ratios=[1, 1, 1, 1.0])
+
+    # Header strip: species color chips
+    ax_hdr = fig.add_subplot(gs[0, :])
+    for i, c in enumerate(classes):
+        ax_hdr.add_patch(Rectangle((i, 0), 0.85, 1, color=color_for(c)))
+        ax_hdr.text(i + 0.425, 0.5, c, ha="center", va="center",
+                    fontsize=11, weight="bold",
+                    color=("white" if c in ("grevys_zebra", "rhino", "elephant")
+                           else "black"))
+    ax_hdr.set_xlim(-0.1, n_cls + 0.1); ax_hdr.set_ylim(0, 1)
+    ax_hdr.set_axis_off()
+    ax_hdr.set_title("WildBox species — color coding consistent across the entire dataset description",
+                     fontsize=12, weight="bold")
+
+    # Panel a: count comparison (frames)
+    ax_a = fig.add_subplot(gs[1, 0])
+    ax_a.bar(range(n_cls), [len(train.per_species[c]["frames"]) +
+                            len(val.per_species[c]["frames"]) for c in classes],
+             color=[color_for(c) for c in classes], edgecolor="white")
+    ax_a.set_xticks(range(n_cls)); ax_a.set_xticklabels(classes, rotation=30, ha="right",
+                                                        fontsize=9)
+    ax_a.set_ylabel("frames")
+    ax_a.set_title("(a) Frame count")
+    _style_axes(ax_a)
+
+    # Panel b: median bbox area (px²) per species
+    ax_b = fig.add_subplot(gs[1, 1])
+    medians = []
+    for c in classes:
+        merged = train.per_species[c]["pixel_areas"] + val.per_species[c]["pixel_areas"]
+        medians.append(statistics.median(merged) if merged else 0)
+    ax_b.bar(range(n_cls), medians, color=[color_for(c) for c in classes],
+             edgecolor="white")
+    ax_b.set_xticks(range(n_cls)); ax_b.set_xticklabels(classes, rotation=30, ha="right",
+                                                        fontsize=9)
+    ax_b.set_yscale("log")
+    ax_b.set_ylabel("median bbox px² (log)")
+    ax_b.set_title("(b) Median bbox size")
+    _style_axes(ax_b)
+
+    # Panel c: median depth z per species
+    ax_c = fig.add_subplot(gs[1, 2])
+    medians = []
+    for c in classes:
+        merged = train.per_species[c]["depths_z"] + val.per_species[c]["depths_z"]
+        medians.append(statistics.median(merged) if merged else 0)
+    ax_c.bar(range(n_cls), medians, color=[color_for(c) for c in classes],
+             edgecolor="white")
+    ax_c.axhline(1.0, color="red", linestyle="--", alpha=0.6,
+                 label="VGGT median z=1")
+    ax_c.set_xticks(range(n_cls)); ax_c.set_xticklabels(classes, rotation=30, ha="right",
+                                                        fontsize=9)
+    ax_c.set_ylabel("median depth z")
+    ax_c.set_title("(c) Median depth (synth.)")
+    ax_c.legend(fontsize=8)
+    _style_axes(ax_c)
+
+    # Panel d: median boxes per frame
+    ax_d = fig.add_subplot(gs[1, 3])
+    medians = []
+    for c in classes:
+        merged = (list(train.per_species[c]["boxes_per_frame"].values()) +
+                  list(val.per_species[c]["boxes_per_frame"].values()))
+        medians.append(statistics.median(merged) if merged else 0)
+    ax_d.bar(range(n_cls), medians, color=[color_for(c) for c in classes],
+             edgecolor="white")
+    ax_d.set_xticks(range(n_cls)); ax_d.set_xticklabels(classes, rotation=30, ha="right",
+                                                        fontsize=9)
+    ax_d.set_ylabel("median boxes / frame")
+    ax_d.set_title("(d) Scene density")
+    _style_axes(ax_d)
+
+    # Bottom row: bbox-size-vs-depth scatter (the "story" panel)
+    ax_e = fig.add_subplot(gs[2, :])
+    for c in classes:
+        depths = (train.per_species[c]["depths_z"] +
+                  val.per_species[c]["depths_z"])
+        areas = (train.per_species[c]["pixel_areas"] +
+                 val.per_species[c]["pixel_areas"])
+        if not depths or not areas:
+            continue
+        n = min(len(depths), len(areas))
+        depths = depths[:n]; areas = areas[:n]
+        if n > 3000:
+            stride = n // 3000
+            depths = depths[::stride]; areas = areas[::stride]
+        ax_e.scatter(depths, areas, s=10, alpha=0.4,
+                     color=color_for(c), edgecolors="none", label=c)
+    ax_e.set_yscale("log")
+    ax_e.set_xlabel("camera-frame depth z (synthetic units)")
+    ax_e.set_ylabel("bbox pixel area  (log px²)")
+    ax_e.set_title("(e) Bbox size vs. depth — per-species clusters separate by body size and altitude",
+                    loc="left")
+    ax_e.legend(loc="upper right", fontsize=9, markerscale=2.0)
+    _style_axes(ax_e)
+    ax_e.grid(True, which="both", axis="both", alpha=0.2, linestyle="--", linewidth=0.5)
+
+    fig.suptitle("WildBox Dataset Dashboard — TL;DR for ML and ecology audiences",
+                 fontsize=14, weight="bold", y=1.005)
+    fig.tight_layout(); fig.savefig(fig_dir / "species_dashboard.png", dpi=140,
+                                    bbox_inches="tight")
+    plt.close(fig)
+
+    # =============================================================
+    # Legacy named figures kept as compat aliases (old paths still resolve)
+    # =============================================================
+    # We unified the two distribution figures into video_segment_distribution.png;
+    # save thin alias copies for any code/script still referencing the old names.
+    import shutil
+    for src, dst in [("video_segment_distribution.png", "frames_per_video.png"),
+                     ("video_segment_distribution.png", "frames_per_segment.png")]:
+        try:
+            shutil.copyfile(fig_dir / src, fig_dir / dst)
+        except Exception:
+            pass
 
 
 # ---------- main ----------
