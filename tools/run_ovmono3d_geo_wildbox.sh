@@ -149,7 +149,23 @@ evaluate_predictions(
         --gt    "$GT" \
         --nhd 2>&1 | tee "$OUT/summary_nhd.txt"
 
-    # 5. paper_report assembly (matches run_full_eval.sh CLI shape)
+    # 5. Paper visualizations — same script LIFT uses, model-agnostic.
+    # 2x3 layout per sample: GT (2D | 3D | novel-view-60deg) on top, pred on
+    # bottom. With- and without-grid variants. Skipped quietly if
+    # visualization fails (e.g. open3d-headless edge cases on a node without
+    # display libs).
+    PREDS="$OUT/inference/iter_final/WildBox_val/instances_predictions.pth"
+    if [ -f "$PREDS" ]; then
+        python tools/visualize_class_agnostic.py \
+            --preds "$PREDS" --gt "$GT" --out "$OUT/vis_ovmono3d" \
+            --top-k 5 --every 100 --limit 40 \
+            2>&1 | tee "$OUT/vis.log" \
+            || echo "  (vis skipped — see $OUT/vis.log)"
+    else
+        echo "  (vis skipped — no predictions symlink at $PREDS)"
+    fi
+
+    # 6. paper_report assembly (matches run_full_eval.sh CLI shape)
     python tools/make_report.py \
         --run-dir "$OUT" \
         --label   "OVMono3D-GEO ($TAG)" \
