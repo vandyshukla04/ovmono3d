@@ -58,8 +58,11 @@ def evaluate_predictions(
     # Setup categories
     setup_categories(category_path)
 
-    # Initialize evaluation helper
-    thing_classes = ['monitor', 'bag', 'dresser', 'board', 'printer', 'keyboard', 'painting', 'drawers', 'microwave', 'computer', 'kitchen pan', 'potted plant', 'tissues', 'rack', 'tray', 'toys', 'phone', 'podium', 'cart', 'soundsystem', 'fireplace', 'tram']
+    # Initialize evaluation helper. Read thing_classes from category_meta.json
+    # rather than hardcoding the indoor-scene Omni3D-novel list — that bug
+    # silently dropped every WildBox prediction as "out of vocabulary" and
+    # killed the NHD accumulator with KeyError: 'overall' in summarize_all.
+    thing_classes = util.load_json(category_path)['thing_classes']
     filter_settings['category_names'] = thing_classes
     eval_helper = Omni3DEvaluationHelper(
         dataset_names=dataset_names,

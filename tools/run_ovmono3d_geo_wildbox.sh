@@ -86,10 +86,18 @@ run_one() {
     echo "    output:    $OUT"
     echo "================================================================"
 
-    # 1. GEO inference (SAM + Depth Pro + PCA per matched 2D box)
-    OVMONO3D_GEO_DATASETS="WildBox_val:${SRC_2D}" \
-    OVMONO3D_GEO_OUTPUT_DIR="$OUT" \
-        python tools/ovmono3d_geo.py 2>&1 | tee "$OUT/inference.log"
+    # 1. GEO inference (SAM + Depth Pro + PCA per matched 2D box). Skip if
+    # the prediction file is already present — lets us re-run the launcher
+    # to redo just the eval stages after a downstream bug, without burning
+    # the multi-hour inference again. Set FORCE_INFERENCE=1 to override.
+    if [ -f "$OUT/WildBox_val.pth" ] && [ "${FORCE_INFERENCE:-0}" != "1" ]; then
+        echo "==> WildBox_val.pth already exists — skipping inference."
+        echo "    set FORCE_INFERENCE=1 to redo it from scratch."
+    else
+        OVMONO3D_GEO_DATASETS="WildBox_val:${SRC_2D}" \
+        OVMONO3D_GEO_OUTPUT_DIR="$OUT" \
+            python tools/ovmono3d_geo.py 2>&1 | tee "$OUT/inference.log"
+    fi
 
     [ -f "$OUT/WildBox_val.pth" ] || {
         echo "FAIL: $OUT/WildBox_val.pth missing — inference broke" >&2
