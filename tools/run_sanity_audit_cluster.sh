@@ -21,10 +21,13 @@ LOG="${LOG:-output/sanity_audit.log}"
 mapfile -t RUNS < <(
   for d in output/wl6_*; do
     [ -d "$d" ] || continue
-    # multi-seed dirs nest as run/seedN/inference/iter_*/dataset/preds.pth
-    # (depth 5), single-run dirs are run/inference/iter_*/dataset/preds.pth
-    # (depth 4). Use depth 6 to safely cover both, plus future variants.
-    if find "$d" -maxdepth 6 -name "instances_predictions.pth" -print -quit \
+    # Phase 1 (the depth-dominance recap, per-class APs) needs only
+    # paper_report/metrics.json. Phase 2 (deep analysis) additionally needs
+    # raw instances_predictions.pth — the python script skips gracefully
+    # per-run when those are absent. So gate discovery on metrics.json
+    # presence, not predictions, so cleaned-up FT runs still surface in
+    # the appendix's Phase-1 tables.
+    if find "$d" -maxdepth 6 -path "*paper_report/metrics.json" -print -quit \
             | grep -q .; then
       echo "$d"
     fi
