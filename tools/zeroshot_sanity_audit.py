@@ -540,7 +540,8 @@ def scale_alignment_ladder(pairs: list[dict], cat_id_to_name: dict,
 
 def relaxed_bev_ap(preds_pth: Path, gt: dict,
                    thresholds=(0.50, 0.25, 0.10, 0.05, 0.025, 0.01),
-                   timeout_sec: int = 3600) -> dict:
+                   timeout_sec: int = 3600,
+                   score_min: float = 0.0) -> dict:
     """Sub-shell out to bev_ap_eval.py at relaxed IoU thresholds.
 
     Reviewer concern: "Evaluate at very relaxed IoU thresholds." If predictions
@@ -550,28 +551,32 @@ def relaxed_bev_ap(preds_pth: Path, gt: dict,
 
     RPN-transfer runs emit ~1.4M unfiltered region proposals; at six IoU
     thresholds × 6 classes, the macro AP loop is O(preds × GT) per cell. We
-    bump timeout to 1h by default; override via --bev-timeout in main().
+    auto-apply score_min=0.3 to such runs in main() — preds below 0.3 are
+    noise anyway and would dominate the FP tail of the PR curve.
     """
     import subprocess
     import tempfile
     out_json = Path(tempfile.mkstemp(suffix="_bev.json")[1])
+    cmd = [sys.executable, str(Path(__file__).parent / "bev_ap_eval.py"),
+           "--preds", str(preds_pth),
+           "--gt", str(gt["__path__"]),
+           "--iou-thresholds", *[str(t) for t in thresholds],
+           "--score-min", str(score_min),
+           "--out", str(out_json)]
     try:
-        subprocess.run(
-            [sys.executable, str(Path(__file__).parent / "bev_ap_eval.py"),
-             "--preds", str(preds_pth),
-             "--gt", str(gt["__path__"]),
-             "--iou-thresholds", *[str(t) for t in thresholds],
-             "--out", str(out_json)],
-            check=True, capture_output=True, text=True, timeout=timeout_sec,
-        )
+        subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       timeout=timeout_sec)
         return json.loads(out_json.read_text())
     except subprocess.TimeoutExpired:
-        return {"error": (f"timeout after {timeout_sec}s — too many preds; "
-                          f"try --bev-skip-rpn or --score-min 0.3 in eval pipeline")}
+        return {"error": (f"timeout after {timeout_sec}s — too many preds")}
     except subprocess.CalledProcessError as e:
-        return {"error": (e.stderr or "")[-200:]}
+        # Earlier versions exposed only str(e) ("Command '...' returned ...");
+        # actual stderr is the diagnostic the user wants. Show both, stderr
+        # first because it usually pinpoints the failure (OOM, KeyError, etc.).
+        stderr_tail = (e.stderr or "").strip()[-300:] or "<empty stderr>"
+        return {"error": f"exit {e.returncode}: {stderr_tail}"}
     except Exception as e:
-        return {"error": str(e)[:200]}
+        return {"error": f"{type(e).__name__}: {str(e)[:250]}"}
     finally:
         if out_json.exists():
             out_json.unlink()
@@ -839,19 +844,26 @@ def write_markdown(out_path: Path, *, phase1: dict,
             L.append("")
             L.append("Confirms zero-shot stays at 0.00 even when the IoU bar is "
                      "dropped to 1%. Predictions are not 'almost right' at lower "
-                     "IoUs — they are categorically scale-broken.")
+                     "IoUs — they are categorically scale-broken. The "
+                     "`score_min` column reports any per-run filter applied "
+                     "before BEV-AP computation; for RPN-transfer (>1M "
+                     "unfiltered region proposals) we use 0.3 to keep the "
+                     "evaluation tractable while preserving the AP@high-recall "
+                     "tail that matters for the 'is it close?' question.")
             L.append("")
             ks = ("IoU=0.50", "IoU=0.25", "IoU=0.10", "IoU=0.05",
                   "IoU=0.02", "IoU=0.01")
-            L.append("| Run | " + " | ".join(ks) + " |")
-            L.append("|---|" + "|".join(["---:"] * len(ks)) + "|")
+            L.append("| Run | score_min | " + " | ".join(ks) + " |")
+            L.append("|---|---:|" + "|".join(["---:"] * len(ks)) + "|")
             for tag, table in phase2["relaxed_bev"].items():
+                sm = table.get("_score_min_applied", 0.0)
                 if "error" in table:
-                    L.append(f"| {tag} | _bev_ap_eval failed: {table['error'][:60]}_ |")
+                    L.append(f"| {tag} | {sm:.2f} | "
+                             f"_bev_ap_eval failed: {table['error'][:80]}_ |")
                     continue
                 macro = table.get("macro", {})
                 cells = [f"{macro.get(k, 0.0):.2f}" for k in ks]
-                L.append(f"| {tag} | " + " | ".join(cells) + " |")
+                L.append(f"| {tag} | {sm:.2f} | " + " | ".join(cells) + " |")
             L.append("")
 
     out_path.write_text("\n".join(L))
@@ -927,10 +939,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 phase2["scale_ladder"][tag] = scale_alignment_ladder(pairs, c2n)
                 phase2["center_depth"][tag] = center_depth_per_species(pairs, c2n)
                 # relaxed BEV is expensive — only run on zero-shot runs (where
-                # the appendix story matters most)
-                if "zeroshot" in tag.lower() or "zero_shot" in tag.lower():
+                # the appendix story matters most). Auto-apply score_min=0.3
+                # for RPN-transfer (1.4M unfiltered preds → BEV-AP otherwise
+                # crashes/times out). Oracle-2D and GEO use 0.0 because their
+                # prediction sets are already filtered or score-bounded.
+                if "zeroshot" in tag.lower() or "zero_shot" in tag.lower() \
+                        or "_geo_" in tag.lower():
+                    sm = 0.3 if "rpn" in tag.lower() else 0.0
                     phase2["relaxed_bev"][tag] = relaxed_bev_ap(
-                        preds_pth, gt, args.bev_thresholds)
+                        preds_pth, gt, args.bev_thresholds,
+                        score_min=sm)
+                    phase2["relaxed_bev"][tag]["_score_min_applied"] = sm
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     write_markdown(args.out, phase1=p1, per_class_rows=pc, bev_rows=bv, phase2=phase2)
