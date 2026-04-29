@@ -136,9 +136,26 @@ def _find_metrics_json(run: Path) -> Optional[Path]:
     return hits[0] if hits else None
 
 
-def _enumerate_run_metrics(run: Path) -> list[tuple[str, Path, dict]]:
-    """Returns a list of (label, metrics_path, parsed_metrics) for `run`,
-    expanding multi-seed dirs into one entry per seed."""
+def _subset_suffix(run_root: Path) -> str:
+    """If a run dir contains EVAL_SUBSET_INFO.json (written by the GEO
+    launcher when STRIDE>1), return a `(subset stride-N)` suffix to append
+    to the run tag everywhere it appears in the appendix. Otherwise empty.
+
+    Per-run subsets must be visible in every table so reviewers see the
+    asymmetry instead of accidentally averaging full-set and subset rows."""
+    sub = run_root / "EVAL_SUBSET_INFO.json"
+    if sub.exists():
+        try:
+            d = json.loads(sub.read_text())
+            return f" [{d.get('subset_marker', 'subset')}]"
+        except Exception:
+            return " [subset]"
+    return ""
+
+
+def _enumerate_run_metrics(run: Path) -> list[tuple[str, Path, dict, bool]]:
+    """Returns a list of (label, metrics_path, parsed_metrics, is_subset) for
+    `run`, expanding multi-seed dirs into one entry per seed."""
     results = []
     seed_dirs = sorted([p for p in run.glob("seed*") if p.is_dir()])
     if seed_dirs:
@@ -146,12 +163,15 @@ def _enumerate_run_metrics(run: Path) -> list[tuple[str, Path, dict]]:
             mp = _find_metrics_json(sd)
             if mp is None:
                 continue
-            tag = f"{run.name}/{sd.name}"
-            results.append((tag, mp, json.loads(mp.read_text())))
+            suffix = _subset_suffix(sd) or _subset_suffix(run)
+            tag = f"{run.name}/{sd.name}{suffix}"
+            results.append((tag, mp, json.loads(mp.read_text()), bool(suffix)))
     else:
         mp = _find_metrics_json(run)
         if mp is not None:
-            results.append((run.name, mp, json.loads(mp.read_text())))
+            suffix = _subset_suffix(run)
+            tag = f"{run.name}{suffix}"
+            results.append((tag, mp, json.loads(mp.read_text()), bool(suffix)))
     return results
 
 
@@ -167,7 +187,7 @@ def phase1_depth_dominance(runs: list[Path]) -> dict:
     """
     rows = []
     for run in runs:
-        for label, mp, m in _enumerate_run_metrics(run):
+        for label, mp, m, is_subset in _enumerate_run_metrics(run):
             r = m["runs"][0]
             log = r.get("log", {})
             three = log.get("3D", {})
@@ -182,19 +202,29 @@ def phase1_depth_dominance(runs: list[Path]) -> dict:
             rows.append({
                 "tag": label,
                 "label": r.get("label", label),
+                "is_subset": is_subset,
                 "overall_NHD": ov,
                 "xy": xy, "z": z, "dim": dm, "pose": po,
                 "z_over_overall": z / ov if ov else float("nan"),
                 "z_over_sum":     z / s  if s  else float("nan"),
             })
 
-    z_over_ov_vals = [r["z_over_overall"] for r in rows]
-    z_over_sum_vals = [r["z_over_sum"] for r in rows]
+    # Headline depth-dominance ranges quoted in the abstract should be
+    # built only from full-set runs, so a stride-4 subset row (e.g. GEO)
+    # never silently contracts or stretches the cited interval. Rows
+    # carry an explicit is_subset flag (set from EVAL_SUBSET_INFO.json).
+    full_rows = [r for r in rows if not r["is_subset"]]
+    z_over_ov_vals = [r["z_over_overall"] for r in full_rows]
+    z_over_sum_vals = [r["z_over_sum"] for r in full_rows]
 
     return {
         "rows": rows,
-        "range_z_over_overall": (min(z_over_ov_vals), max(z_over_ov_vals)) if rows else (None, None),
-        "range_z_over_sum":     (min(z_over_sum_vals), max(z_over_sum_vals)) if rows else (None, None),
+        "n_full_set_rows": len(full_rows),
+        "n_subset_rows":   len(rows) - len(full_rows),
+        "range_z_over_overall": (min(z_over_ov_vals), max(z_over_ov_vals))
+                                if full_rows else (None, None),
+        "range_z_over_sum":     (min(z_over_sum_vals), max(z_over_sum_vals))
+                                if full_rows else (None, None),
     }
 
 
@@ -203,7 +233,7 @@ def phase1_per_class_table(runs: list[Path]) -> list[dict]:
     the appendix can show "no, the 0.00 3D AP isn't a single-class artifact"."""
     rows = []
     for run in runs:
-        for label, mp, m in _enumerate_run_metrics(run):
+        for label, mp, m, is_subset in _enumerate_run_metrics(run):
             r = m["runs"][0]
             log = r.get("log", {})
             pc = log.get("per_class", {})
@@ -226,7 +256,7 @@ def phase1_bev_at_thresholds(runs: list[Path]) -> list[dict]:
     Phase 2 will re-compute at relaxed thresholds (0.10, 0.05, 0.025, 0.01)."""
     rows = []
     for run in runs:
-        for label, mp, m in _enumerate_run_metrics(run):
+        for label, mp, m, is_subset in _enumerate_run_metrics(run):
             bp = mp.parent.parent / "bev_ap.json"
             if not bp.exists():
                 continue
@@ -667,6 +697,20 @@ def write_markdown(out_path: Path, *, phase1: dict,
              "raw `instances_predictions.pth` was available, deeper per-pair analysis "
              "(Phase 2).")
     L.append("")
+    if phase1.get("n_subset_rows", 0) > 0:
+        L.append(
+            "**Subset rows.** Some runs (e.g. OVMono3D-GEO, marked "
+            "`[stride-N]`) were evaluated on a strided sub-sample of the val "
+            "set due to per-frame compute cost — this is recorded in each "
+            "run dir's `EVAL_SUBSET_INFO.json`. AP-based rows on those runs "
+            "are computed against the matching GT subset only. NHD-based "
+            "rows (depth-dominance, scale ladder, per-species z-share, "
+            "outlier-clipped) are matched-pair-only diagnostics and are "
+            "unaffected by sub-sampling, so they remain directly comparable "
+            "to full-set rows. Headline ranges in §A.2 are computed from "
+            "full-set rows only to avoid silent denominator mixing."
+        )
+        L.append("")
     L.append("## A.1 — NHD definition and same-extent normalization")
     L.append("")
     L.append("Reviewers asked for an explicit NHD formula and confirmation that "
@@ -697,7 +741,18 @@ def write_markdown(out_path: Path, *, phase1: dict,
     lo_ov, hi_ov = phase1["range_z_over_overall"]
     lo_su, hi_su = phase1["range_z_over_sum"]
     L.append("")
-    L.append(f"**Range across all reported runs:**")
+    n_full = phase1.get("n_full_set_rows", 0)
+    n_subset = phase1.get("n_subset_rows", 0)
+    range_caption = (
+        f"**Range across full-set runs** (excludes {n_subset} subset row"
+        f"{'s' if n_subset != 1 else ''}; "
+        f"both ratios are matched-pair-only and would be comparable, but "
+        f"keeping subset rows out of the headline range avoids any "
+        f"reviewer confusion about denominator mixing):"
+        if n_subset > 0 else
+        f"**Range across all {n_full} reported runs:**"
+    )
+    L.append(range_caption)
     L.append(f"- `z/overall` (depth's share of full-prediction NHD): "
              f"**{100*lo_ov:.1f}%–{100*hi_ov:.1f}%**")
     L.append(f"- `z/sum`     (depth's share among leave-one-in components): "
@@ -921,7 +976,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "scale_ladder": {}, "center_depth": {}, "relaxed_bev": {},
         }
         for run in runs:
-            for tag, _, _ in _enumerate_run_metrics(run):
+            for tag, _, _, _ in _enumerate_run_metrics(run):
                 # locate predictions for this entry
                 if "/seed" in tag:
                     sd = run / tag.split("/", 1)[1]

@@ -110,6 +110,20 @@ run_one() {
     ln -sf "$(realpath "$OUT/WildBox_val.pth")" \
         "$OUT/inference/iter_final/WildBox_val/instances_predictions.pth"
 
+    # Subset marker — read by the sanity audit so the row is labelled
+    # "(subset N/M frames)" everywhere it appears, with no risk of being
+    # silently mixed into full-set comparisons.
+    if [ "${OVMONO3D_GEO_STRIDE:-1}" -gt 1 ]; then
+        cat > "$OUT/EVAL_SUBSET_INFO.json" <<JSON
+{
+  "subset_marker": "stride-${OVMONO3D_GEO_STRIDE}",
+  "reason": "GEO per-frame compute cost (Depth Pro + SAM-H per detection)",
+  "stride": ${OVMONO3D_GEO_STRIDE},
+  "note": "AP rows on this run are computed against GT for the strided image set only; NHD/depth-dominance ratios are matched-pair-only and unaffected by subsampling."
+}
+JSON
+    fi
+
     # 2. Standard Omni3D evaluator (BEV + 2D + disentangled NHD)
     echo
     echo "==> GEO eval: $TAG"
