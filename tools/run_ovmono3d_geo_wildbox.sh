@@ -33,6 +33,28 @@ cd "$(git rev-parse --show-toplevel)"
 
 PROTOCOL="${1:-oracle2d}"
 
+# Cuda fragmentation mitigation — Depth Pro's residual blocks hit OOM on
+# 44GB GPUs once the card is shared with a second torch process; expandable
+# segments lets allocations grow into freed regions instead of fragmenting.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# Pre-flight GPU sanity: refuse to launch if the pinned device already has
+# >2 GB used by another process. Saves the user from discovering OOM 30 min
+# into a multi-hour run.
+if command -v nvidia-smi >/dev/null && [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    DEV="${CUDA_VISIBLE_DEVICES%%,*}"
+    USED_MB=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+              -i "$DEV" 2>/dev/null | tr -d ' ' || echo 0)
+    if [ "$USED_MB" -gt 2048 ] 2>/dev/null; then
+        echo "!!! GPU $DEV already has ${USED_MB} MiB in use by another process." >&2
+        echo "    Pick an idle GPU. Current state:" >&2
+        nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu \
+                   --format=csv >&2
+        exit 3
+    fi
+    echo "==> GPU $DEV: ${USED_MB} MiB used at launch (OK)"
+fi
+
 GT="datasets/Omni3D/WildBox_val.json"
 ORACLE_JSON="datasets/Omni3D/gdino_WildBox_val_oracle_2d.json"
 # rpn-from-lift: feed GEO with LIFT's own RPN-transfer predictions as the 2D
