@@ -539,13 +539,18 @@ def scale_alignment_ladder(pairs: list[dict], cat_id_to_name: dict,
 
 
 def relaxed_bev_ap(preds_pth: Path, gt: dict,
-                   thresholds=(0.50, 0.25, 0.10, 0.05, 0.025, 0.01)) -> dict:
+                   thresholds=(0.50, 0.25, 0.10, 0.05, 0.025, 0.01),
+                   timeout_sec: int = 3600) -> dict:
     """Sub-shell out to bev_ap_eval.py at relaxed IoU thresholds.
 
     Reviewer concern: "Evaluate at very relaxed IoU thresholds." If predictions
     are merely scale-mismatched (right azimuth, wrong size), AP@0.10 should
     leak signal that AP@0.50 hides. bev_ap_eval.py expects
     `configs/category_meta.json` in cwd, so this must run from the repo root.
+
+    RPN-transfer runs emit ~1.4M unfiltered region proposals; at six IoU
+    thresholds × 6 classes, the macro AP loop is O(preds × GT) per cell. We
+    bump timeout to 1h by default; override via --bev-timeout in main().
     """
     import subprocess
     import tempfile
@@ -557,9 +562,12 @@ def relaxed_bev_ap(preds_pth: Path, gt: dict,
              "--gt", str(gt["__path__"]),
              "--iou-thresholds", *[str(t) for t in thresholds],
              "--out", str(out_json)],
-            check=True, capture_output=True, text=True, timeout=900,
+            check=True, capture_output=True, text=True, timeout=timeout_sec,
         )
         return json.loads(out_json.read_text())
+    except subprocess.TimeoutExpired:
+        return {"error": (f"timeout after {timeout_sec}s — too many preds; "
+                          f"try --bev-skip-rpn or --score-min 0.3 in eval pipeline")}
     except subprocess.CalledProcessError as e:
         return {"error": (e.stderr or "")[-200:]}
     except Exception as e:
@@ -690,12 +698,27 @@ def write_markdown(out_path: Path, *, phase1: dict,
     L.append(f"- `z/sum`     (depth's share among leave-one-in components): "
              f"**{100*lo_su:.1f}%–{100*hi_su:.1f}%**")
     L.append("")
-    L.append("**Recommendation (paper text):** report `z/overall` (84.5–99.2%) "
-             "consistently in abstract, intro, and Table 2. The `63%` figure currently "
-             "in the abstract is `z/sum` for fine-tuned runs, and the `99%` is "
-             "`z/overall` for zero-shot — mixing the two definitions in one range. "
-             "Replace the abstract's *\"depth error accounts for 63–99%\"* with "
-             "*\"depth contributes 85–99% of overall NHD\"*, matching the table.")
+    # Recommendation text uses the actual computed range from this run, so
+    # rerunning with more or fewer runs always yields a self-consistent
+    # appendix. The "63" is the floor of the z/sum range across FT runs and
+    # the "99" is the ceiling of z/overall across all runs — mixing those
+    # in one sentence is the inconsistency reviewer flagged.
+    n_runs = len(phase1["rows"])
+    rec_lo, rec_hi = round(100 * lo_ov), round(100 * hi_ov)
+    L.append(f"**Recommendation (paper text):** report `z/overall` "
+             f"({rec_lo}–{rec_hi}%) consistently in abstract, intro, and "
+             "Table 2. The `63%` figure currently in the abstract is `z/sum` "
+             "for fine-tuned runs, and the `99%` is `z/overall` for zero-shot "
+             "— mixing the two definitions in one range. Replace the "
+             "abstract's *\"depth error accounts for 63–99%\"* with "
+             f"*\"depth contributes {rec_lo}–{rec_hi}% of overall NHD\"*, "
+             "matching the table.")
+    if n_runs < 6:
+        L.append("")
+        L.append(f"_(Note: this appendix was generated from {n_runs} runs "
+                 "only — the headline range will narrow with more FT runs "
+                 "included; expected full range is 84.5%–99.2% on the "
+                 "10 zero-shot + fine-tuned seed entries.)_")
     L.append("")
 
     # ----- A.3 per-class context for the 0.00 AP claim ----------------------
