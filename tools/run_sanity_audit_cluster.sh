@@ -21,7 +21,11 @@ LOG="${LOG:-output/sanity_audit.log}"
 mapfile -t RUNS < <(
   for d in output/wl6_*; do
     [ -d "$d" ] || continue
-    if find "$d" -maxdepth 4 -name "instances_predictions.pth" -print -quit | grep -q .; then
+    # multi-seed dirs nest as run/seedN/inference/iter_*/dataset/preds.pth
+    # (depth 5), single-run dirs are run/inference/iter_*/dataset/preds.pth
+    # (depth 4). Use depth 6 to safely cover both, plus future variants.
+    if find "$d" -maxdepth 6 -name "instances_predictions.pth" -print -quit \
+            | grep -q .; then
       echo "$d"
     fi
   done

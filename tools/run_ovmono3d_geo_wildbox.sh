@@ -5,14 +5,23 @@
 # from a *different model family* (geometric: SAM + Depth Pro + PCA, no
 # learned cube head).
 #
+# GEO is a purely geometric pipeline (SAM + Depth Pro + PCA) that consumes
+# 2D boxes from an *external* source — there is no "RPN-transfer" baseline
+# for GEO because GEO has no learned RPN of its own. The cross-protocol
+# story (oracle vs RPN as the 2D source) is already covered by the two LIFT
+# zero-shot rows; for GEO we only run the oracle-2D protocol.
+#
 # Run from repo root, with cluster GPU available:
-#   bash tools/run_ovmono3d_geo_wildbox.sh                   # both protocols
-#   bash tools/run_ovmono3d_geo_wildbox.sh oracle2d          # GDino-oracle 2D only
-#   bash tools/run_ovmono3d_geo_wildbox.sh rpn               # RPN-transfer 2D only
+#   bash tools/run_ovmono3d_geo_wildbox.sh                   # oracle2d (default)
+#   bash tools/run_ovmono3d_geo_wildbox.sh oracle2d          # explicit
+#   bash tools/run_ovmono3d_geo_wildbox.sh rpn-from-lift     # opt-in: feed
+#                                                              GEO with LIFT's
+#                                                              own RPN preds as
+#                                                              the 2D source
+#                                                              (advanced)
 #
 # Outputs:
 #   output/wl6_geo_oracle2d/        — GEO predictions + paper_report
-#   output/wl6_geo_rpn/             — GEO predictions + paper_report
 #   output/wl6_geo_*/log.txt        — full inference + eval log
 #
 # Prereqs (one-time):
@@ -22,11 +31,13 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-PROTOCOL="${1:-all}"
+PROTOCOL="${1:-oracle2d}"
 
 GT="datasets/Omni3D/WildBox_val.json"
 ORACLE_JSON="datasets/Omni3D/gdino_WildBox_val_oracle_2d.json"
-RPN_JSON="datasets/Omni3D/rpn_WildBox_val_2d.json"
+# rpn-from-lift: feed GEO with LIFT's own RPN-transfer predictions as the 2D
+# source. Only meaningful if you have a LIFT zeroshot_rpn run on disk.
+RPN_FROM_LIFT_JSON="${RPN_FROM_LIFT_JSON:-output/wl6_zeroshot_rpn/inference/iter_final/WildBox_val/instances_predictions.pth}"
 
 # guard: GT + the per-protocol 2D source JSONs must exist
 [ -f "$GT" ] || { echo "missing $GT" >&2; exit 1; }
@@ -112,14 +123,19 @@ evaluate_predictions(
 }
 
 case "$PROTOCOL" in
-    oracle2d) run_one "oracle2d" "$ORACLE_JSON" ;;
-    rpn)      run_one "rpn"      "$RPN_JSON" ;;
-    all)
+    oracle2d)
         run_one "oracle2d" "$ORACLE_JSON"
-        run_one "rpn"      "$RPN_JSON"
+        ;;
+    rpn-from-lift)
+        # advanced opt-in path; needs a LIFT zeroshot_rpn run on disk
+        # converted into oracle-shape JSON. Out of scope for v1.0 paper.
+        echo "rpn-from-lift not yet implemented — feeds LIFT RPN preds back" \
+             "into GEO as the 2D source. Use 'oracle2d' (default)." >&2
+        exit 2
         ;;
     *)
-        echo "usage: $0 [oracle2d|rpn|all]" >&2
+        echo "usage: $0 [oracle2d|rpn-from-lift]" >&2
+        echo "  default: oracle2d" >&2
         exit 2
         ;;
 esac
