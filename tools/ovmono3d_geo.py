@@ -263,6 +263,16 @@ dataset_list = {
                 'ARKitScenes_test_novel': './datasets/Omni3D/gdino_arkitscenes_novel_oracle_2d.json',
                 'SUNRGBD_test_novel': './datasets/Omni3D/gdino_sunrgbd_novel_oracle_2d.json',}
 
+# CLI override (used by tools/run_ovmono3d_geo_wildbox.sh): set
+# OVMONO3D_GEO_DATASETS as 'name1:path1,name2:path2' to replace dataset_list.
+# OVMONO3D_GEO_OUTPUT_DIR overrides the './output/ovmono3d_geo' default below.
+# OVMONO3D_GEO_SCORE_MIN overrides the per-instance score gate (default 0.30).
+_env_ds = os.environ.get('OVMONO3D_GEO_DATASETS', '').strip()
+if _env_ds:
+    dataset_list = {item.split(':', 1)[0]: item.split(':', 1)[1]
+                    for item in _env_ds.split(',') if ':' in item}
+    print(f"[ovmono3d_geo] dataset_list overridden via env: {list(dataset_list)}")
+
 # Load model and preprocessing transform
 depthpro_model, depthpro_transform = depth_pro.create_model_and_transforms(device=torch.device("cuda"),precision=torch.float16)
 depthpro_model.eval()
@@ -271,7 +281,7 @@ ckpt = "./checkpoints/sam_vit_h_4b8939.pth"
 sam = sam_model_registry["default"](checkpoint=ckpt).to(device="cuda")
 seg_predictor = SamPredictor(sam)
 
-threshold = 0.30
+threshold = float(os.environ.get('OVMONO3D_GEO_SCORE_MIN', '0.30'))
 
 for dataset_name, dataset_pth in dataset_list.items():
     with open(dataset_pth, 'r') as f:
@@ -325,7 +335,7 @@ for dataset_name, dataset_pth in dataset_list.items():
         new_img["instances"] = new_instances
         new_dataset.append(new_img)
     # Create output directory if it doesn't exist
-    output_dir = "./output/ovmono3d_geo"
+    output_dir = os.environ.get('OVMONO3D_GEO_OUTPUT_DIR', './output/ovmono3d_geo')
     os.makedirs(output_dir, exist_ok=True)
-    
+
     torch.save(new_dataset, f"{output_dir}/{dataset_name}.pth")
