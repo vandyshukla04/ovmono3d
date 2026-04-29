@@ -292,6 +292,16 @@ for dataset_name, dataset_pth in dataset_list.items():
     imgid2path = {}
     for img in gt_anns["images"]:
         imgid2path[img['id']] = img['file_path']
+    # Frame-stride subsampling (env: OVMONO3D_GEO_STRIDE). Set to N>1 to
+    # process every Nth image — useful when the full eval doesn't fit in
+    # cluster wall-time. WildBox val frames are extracted at 10fps from 30fps
+    # source, so adjacent frames show nearly-identical animal poses; STRIDE=3
+    # cuts inference time by ~3x while preserving the per-segment distribution.
+    _stride = int(os.environ.get('OVMONO3D_GEO_STRIDE', '1'))
+    if _stride > 1:
+        dataset = dataset[::_stride]
+        print(f"[ovmono3d_geo] STRIDE={_stride}: keeping "
+              f"{len(dataset)} images (every {_stride}th)")
     new_dataset = []
     for img in tqdm.tqdm(dataset):
         im_path = os.path.join(root, imgid2path[img['image_id']])

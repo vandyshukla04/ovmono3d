@@ -33,6 +33,13 @@ cd "$(git rev-parse --show-toplevel)"
 
 PROTOCOL="${1:-oracle2d}"
 
+# Frame-stride for the GEO inference loop (every Nth image). Default 1
+# (full set). Set STRIDE=3 to fit the run in a 24h GPU allocation:
+#   STRIDE=3 bash tools/run_ovmono3d_geo_wildbox.sh oracle2d
+# Reasonable choices on WildBox val (13779 frames at ~10s/frame):
+#   STRIDE=1 → ~38h    STRIDE=2 → ~19h    STRIDE=3 → ~13h    STRIDE=4 → ~10h
+export OVMONO3D_GEO_STRIDE="${STRIDE:-${OVMONO3D_GEO_STRIDE:-1}}"
+
 # Cuda fragmentation mitigation — Depth Pro's residual blocks hit OOM on
 # 44GB GPUs once the card is shared with a second torch process; expandable
 # segments lets allocations grow into freed regions instead of fragmenting.
