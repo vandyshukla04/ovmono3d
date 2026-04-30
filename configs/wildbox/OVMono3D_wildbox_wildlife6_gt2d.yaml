@@ -1,0 +1,28 @@
+_BASE_: "OVMono3D_wildbox_wildlife6.yaml"
+
+# GT-2D ceiling for the 6-species setup: feed the perfect ground-truth 2D
+# boxes (from WildBox_val.json annotations, exported by
+# tools/build_gt2d_oracle_json.py) as oracle input to the 3D cube head.
+# Isolates the 3D head's contribution to error: 2D detection + class
+# prediction errors are zero by construction. The remaining gap is purely
+# the 3D head failing to adapt from Omni3D-metric scale to WildBox's
+# median-|Z|=1 VGGT-synthetic scale.
+TEST:
+  ORACLE2D: True
+  REL_AP3D_SEARCH: [0.05, 3.0, 32]
+
+DATASETS:
+  ORACLE2D_FILES:
+    EVAL_MODE: target_aware
+    target_aware:
+      novel:
+        WildBox_val: datasets/Omni3D/gt2d_WildBox_val_oracle_2d.json
+      base:
+        WildBox_val: datasets/Omni3D/gt2d_WildBox_val_oracle_2d.json
+    previous_metric:
+      novel:
+        WildBox_val: datasets/Omni3D/gt2d_WildBox_val_oracle_2d.json
+      base:
+        WildBox_val: datasets/Omni3D/gt2d_WildBox_val_oracle_2d.json
+
+OUTPUT_DIR: "output/wl6_zeroshot_gt2d"
