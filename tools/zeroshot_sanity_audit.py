@@ -971,12 +971,28 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         gt = json.loads(Path(args.gt).read_text())
         gt["__path__"] = str(args.gt)
-        phase2 = {
-            "coordinate": {}, "per_species_nhd": {}, "outlier_clipped": {},
-            "scale_ladder": {}, "center_depth": {}, "relaxed_bev": {},
-        }
+
+        # Incremental-save checkpoint. After each run completes, the in-memory
+        # phase2 dict is pickled next to the output markdown. On re-run, we
+        # load the existing pickle and skip runs already in it. This means a
+        # crash mid-deep-audit doesn't lose hours of CPU work.
+        import pickle
+        ckpt_path = args.out.with_suffix(".phase2.pkl")
+        if ckpt_path.exists():
+            phase2 = pickle.loads(ckpt_path.read_bytes())
+            print(f"  [Phase 2] resuming from {ckpt_path} "
+                  f"({len(phase2.get('coordinate', {}))} runs already done)")
+        else:
+            phase2 = {
+                "coordinate": {}, "per_species_nhd": {}, "outlier_clipped": {},
+                "scale_ladder": {}, "center_depth": {}, "relaxed_bev": {},
+            }
+
         for run in runs:
             for tag, _, _, _ in _enumerate_run_metrics(run):
+                if tag in phase2["coordinate"]:
+                    print(f"  [Phase 2] {tag}: SKIP (already in checkpoint)")
+                    continue
                 # locate predictions for this entry
                 if "/seed" in tag:
                     sd = run / tag.split("/", 1)[1]
@@ -1005,6 +1021,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                         preds_pth, gt, args.bev_thresholds,
                         score_min=sm)
                     phase2["relaxed_bev"][tag]["_score_min_applied"] = sm
+
+                # Incremental save — flush after each completed run so a
+                # crash mid-list doesn't lose previous runs' work.
+                ckpt_path.write_bytes(pickle.dumps(phase2))
+                print(f"  [Phase 2] {tag}: checkpoint saved → {ckpt_path.name}")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     write_markdown(args.out, phase1=p1, per_class_rows=pc, bev_rows=bv, phase2=phase2)
