@@ -73,6 +73,7 @@ def main():
     filter_settings = get_filter_settings_from_cfg(cfg)
     filter_settings["category_names"] = thing_classes
 
+    rel_search = tuple(cfg.TEST.REL_AP3D_SEARCH) if hasattr(cfg.TEST, 'REL_AP3D_SEARCH') else (0.05, 3.0, 32)
     eval_helper = Omni3DEvaluationHelper(
         dataset_names=[args.dataset_name],
         filter_settings=filter_settings,
@@ -80,7 +81,10 @@ def main():
         iter_label="final",
         only_2d=False,
         eval_categories=thing_classes,
+        eval_rel_ap3d=True,                # MUST be a kwarg — helper does not
+        rel_ap3d_search=rel_search,        # read cfg.TEST.EVAL_REL_AP3D itself
     )
+    print(f'[rel-ap3d] eval_rel_ap3d=True, search range = {rel_search}', flush=True)
 
     # Materialise the dataset (registers metadata used by the evaluator)
     DatasetCatalog.get(args.dataset_name)
