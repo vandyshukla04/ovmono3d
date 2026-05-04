@@ -132,13 +132,18 @@ def rescale_one_segment(seg_dir: Path, in_place: bool, target_wh: Tuple[int, int
 
     # 3. Write — either in-place (with backup) or to a new sibling.
     if in_place:
-        # backup originals
+        # backup originals — use shutil.copyfile (content only, no utime
+        # copy) since /mnt/d (NTFS via WSL) rejects the chown/utime that
+        # shutil.copy2 attempts on POSIX filesystems.
         bak = cameras_path.with_suffix(".json.orig518")
         if not bak.exists():
-            shutil.copy2(cameras_path, bak)
+            shutil.copyfile(cameras_path, bak)
         kitti_bak = kitti_dir.parent / "kitti_labels.orig518"
         if not kitti_bak.exists():
-            shutil.copytree(kitti_dir, kitti_bak)
+            kitti_bak.mkdir()
+            for src in kitti_dir.iterdir():
+                if src.is_file():
+                    shutil.copyfile(src, kitti_bak / src.name)
         cameras_path.write_text(json.dumps(new_cameras, indent=2))
         for p, lines in new_kitti_lines.items():
             p.write_text("\n".join(lines) + "\n")
