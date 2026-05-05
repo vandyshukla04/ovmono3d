@@ -1,204 +1,157 @@
-<div align="center">
+# WildBox — OVMono3D-LIFT eval / training code
 
-<!-- # OVMono3D -->
+Supplementary code for the WildBox monocular 3D wildlife detection benchmark
+(anonymous review submission).
 
-# Open Vocabulary Monocular 3D Object Detection
+This repository extends **OVMono3D** (Yao et al., *Open Vocabulary Monocular
+3D Object Detection*, arXiv:2411.16833) with the WildBox dataset configs,
+training scripts, and evaluation pipeline used to produce the numbers in
+the paper. The architecture itself is unchanged from upstream; for the
+upstream README and credits, see [`ORIGINAL_OVMONO3D_README.md`](ORIGINAL_OVMONO3D_README.md).
 
-[Jin Yao][jy], [Hao Gu][hg], [Xuweiyi Chen][xc], [Jiayun Wang][jw], [Zezhou Cheng][zc]
+---
 
+## What's in this repo
 
-[![Website](https://img.shields.io/badge/Project-Page-b361ff
-)](https://uva-computer-vision-lab.github.io/ovmono3d/)
-[![Paper](https://img.shields.io/badge/arXiv-PDF-b31b1b)](https://arxiv.org/pdf/2411.16833)
+| Path | Purpose |
+|------|---------|
+| `configs/wildbox/` | YAML configs for every reported run (5-species pretrain, 6-species fine-tune, GT-2D oracle, geometric baseline) + category metadata |
+| `cubercnn/` | Cube R-CNN model code (mostly upstream from Yao et al.) |
+| `datasets/` | Dataset registration utilities |
+| `tools/train_net.py` | detectron2 training / evaluation entry point |
+| `tools/run_full_eval.sh` | one-shot eval runner: produces 2D + 3D AP, BEV AP, NHD, and Rel-AP3D |
+| `tools/run_multi_seed.sh` / `.sbatch` | multi-seed training (used for ± std bars in the paper) |
+| `tools/run_init5sp_15k_singleseed.sh` | trains the headline curriculum-init checkpoint |
+| `tools/run_gt2d_zs_eval.sh` | zero-shot evaluation with GT 2D box prompts |
+| `tools/run_ovmono3d_geo_wildbox.sh` | runs the geometric baseline (LIFT-vs-GEO comparison) |
+| `tools/assemble_paper_results.py` | aggregates all eval outputs into the paper tables |
+| `tools/bev_ap_eval.py` | BEV AP @ {0.25, 0.5} |
+| `tools/class_agnostic_eval.py` | class-agnostic AP + NHD breakdown |
+| `tools/rel_ap3d_from_predictions.py` | Rel-AP3D (scale-invariant 3D AP) |
+| `tools/aggregate_seed_ap.py` | computes mean ± std across seeds |
+| `tools/precompute_gdino_oracle.py` | Grounding-DINO oracle 2D detections for the GT-2D protocol |
+| `tools/build_gt2d_oracle_json.py` | builds the GT-2D-prompt eval JSON |
+| `tools/prepare_wildbox_dataset.py` | one-time dataset preprocessing |
 
+---
 
-</div>
+## Setup
 
-<table style="border-collapse: collapse; border: none;">
-<tr>
-	<!-- <td width="60%">
-		<p align="center">
-			Zero-shot (+ tracking) on <a href="https://about.facebook.com/realitylabs/projectaria">Project Aria</a> data
-			<img src=".github/generalization_demo.gif" alt="Aria demo video"/ height="300">
-		</p>
-	</td> -->
-	<td width="100%">
-		<p align="center">
-			Zero-shot predictions on COCO
-			<img src=".github/coco.png" alt="COCO demo"/ height="300">
-		</p>
-	</td>
-</tr>
-</table>
-
-
-## Installation <a name="installation"></a>
-Our used cuda version is 12.1.1.
-Run
 ```bash
-conda create -n ovmono3d python=3.8.20
-conda activate ovmono3d
-
-pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+bash setup.sh                 # creates conda env, installs detectron2 + deps
+bash download_data.sh         # downloads pretrained weights (SAM, DINOv2, etc.)
 ```
-to create the environment and install pytorch.
 
-Run
+The WildBox dataset itself is hosted with the paper supplementary materials —
+download `WildBox_train_paper.json`, `WildBox_val_paper.json`, the per-video
+zips, and extract them into `datasets/wildbox/` (extraction recipe is in the
+dataset's `DATASET_README.md`).
+
+---
+
+## Reproducing the paper's headline numbers
+
+The headline result is the **6-species curriculum fine-tune**
+(Table 1, "init5sp curriculum, 10k iters" row), trained as:
+
+1. 10 000 iters of 5-species pretraining on `wildlife5`.
+2. 10 000 iters of 6-species continuation initialised from (1).
+
+### Single-seed reproduction (sufficient for headline mean)
+
 ```bash
-sh setup.sh
+bash tools/run_init5sp_15k_singleseed.sh    # trains the curriculum-init ckpt
+bash tools/run_full_eval.sh \
+    --weights output/wildbox_wl6_init5sp_seed0/model_final.pth \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
+    --out     output/eval_init5sp_seed0 \
+    --label   "curriculum init5sp seed 0"
 ```
-to install additional dependencies and download model checkpoints of OVMono3D-LIFT and other foundation models.
 
-## Demo <a name="demo"></a>
-Run
+The eval produces, in `output/eval_init5sp_seed0/`:
+
+* `paper_report/report.md` – human-readable
+* `paper_report/table_main.tex` – the LaTeX row used in the paper
+* `paper_report/metrics.json` – machine-readable
+
+### Multi-seed reproduction (for ± std bars)
+
 ```bash
-python demo/demo.py --config-file configs/OVMono3D_dinov2_SFP.yaml \
-	--input-folder datasets/coco_examples \
-	--labels-file datasets/coco_examples/labels.json \
-	--threshold 0.45 \
-	MODEL.ROI_HEADS.NAME ROIHeads3DGDINO \
-	MODEL.WEIGHTS checkpoints/ovmono3d_lift.pth \
-	OUTPUT_DIR output/coco_examples 
+bash tools/run_multi_seed.sh                # 3 seeds × init5sp curriculum
+bash tools/run_multi_seed.sh CONFIG=configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
+                              SEEDS="0 1 2"
+python tools/aggregate_seed_ap.py output/wl6_init5sp_multiseed/seed*/eval/
 ```
-to get the results for the example COCO images.
 
-You can also try your own images and prompted category labels. See the format of the label file in [`labels.json`](datasets/coco_examples/labels.json). If you know the camera intrinsics you could input them as arguments with the convention `--focal-length <float>` and `--principal-point <float> <float>`. Check [`demo.py`](demo/demo.py) for more details.
+### Pre-trained checkpoint
 
+The headline checkpoint (`ovmono3d_lift_init5sp_seed0.pth`, 574 MB) is
+provided alongside the dataset in the same anonymous supplementary upload
+(see `CHECKPOINTS_README.md`). To skip training and go straight to eval:
 
-## Data <a name="data"></a>
-Please follow the instructions in [Omni3D](https://github.com/facebookresearch/omni3d/blob/main/DATA.md) to set up the datasets.  
-Run
 ```bash
-sh ./download_data.sh
+bash tools/run_full_eval.sh \
+    --weights /path/to/ovmono3d_lift_init5sp_seed0.pth \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
+    --out     output/eval_pretrained_headline \
+    --label   "pretrained headline"
 ```
-to download our pre-processed OVMono3D 2D predictions (12 GB after unzipping).  
 
+---
 
-## Evaluation <a name="evaluation"></a>
+## Reproducing the ablation table
 
+Direct (no curriculum) fine-tune at matched compute:
 
-To run inference and evaluation of OVMono3D-LIFT, use the following command:
 ```bash
-python tools/train_net.py --eval-only  --config-file configs/OVMono3D_dinov2_SFP.yaml --num-gpus 2 \
-    OUTPUT_DIR  output/ovmono3d_lift  \
-    MODEL.WEIGHTS checkpoints/ovmono3d_lift.pth \
-    TEST.CAT_MODE "novel" \
-    DATASETS.ORACLE2D_FILES.EVAL_MODE "target_aware"
+bash tools/run_multi_seed.sh CONFIG=configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
+                              SEEDS="0 1 2" REPEAT_THRESHOLD=0.5 ITERS=15000
+bash tools/run_multi_seed.sh CONFIG=configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
+                              SEEDS="0"     REPEAT_THRESHOLD=0.35 ITERS=15000
 ```
-TEST.CAT_MODE denotes the category set to be evaluated: `novel` or `base` or `all`
 
-DATASETS.ORACLE2D_FILES.EVAL_MODE denotes the evaluation protocol: `target_aware` or `previous_metric`
+Plateau check (init5sp at 15k):
 
-To run inference and evaluation of OVMono3D-GEO, use the following commands:
 ```bash
-python tools/ovmono3d_geo.py
-python tools/eval_ovmono3d_geo.py
+ITERS=15000 bash tools/run_init5sp_15k_singleseed.sh
 ```
 
+---
 
-## Training <a name="training"></a>
+## Reproducing the zero-shot table
 
-To run training of OVMono3D-LIFT, use the following command:
+Vanilla zero-shot (no fine-tune):
+
 ```bash
-python tools/train_net.py --config-file configs/OVMono3D_dinov2_SFP.yaml --num-gpus 8 \
-    OUTPUT_DIR  output/ovmono3d_lift \
-    VIS_PERIOD 500 TEST.EVAL_PERIOD 2000 \
-    MODEL.STABILIZE  0.03 \
-    SOLVER.BASE_LR 0.012 \
-    SOLVER.CHECKPOINT_PERIOD 1000 \
-    SOLVER.IMS_PER_BATCH 64 
+bash tools/run_full_eval.sh \
+    --weights output/upstream_omni3d_pretrained.pth \
+    --config  configs/wildbox/OVMono3D_wildbox_wildlife6.yaml \
+    --out     output/eval_zeroshot
 ```
 
-The training hyperparameters above are used in our experiments. While these parameters can be customized to suit your specific requirements, please note that performance may vary across different configurations.
+GT-2D-prompt zero-shot (perfect-2D ceiling):
 
-
-## Citing <a name="citing"></a>
-If you find this work useful for your research, please kindly cite:
-
-```BibTeX
-@article{yao2024open,
-  title={Open Vocabulary Monocular 3D Object Detection},
-  author={Yao, Jin and Gu, Hao and Chen, Xuweiyi and Wang, Jiayun and Cheng, Zezhou},
-  journal={arXiv preprint arXiv:2411.16833},
-  year={2024}
-}
-```
-Please also consider cite the awesome work of [Omni3D](https://github.com/facebookresearch/omni3d) and datasets used in Omni3D.
-<details><summary>BibTex</summary>
-
-```BibTeX
-@inproceedings{brazil2023omni3d,
-  author =       {Garrick Brazil and Abhinav Kumar and Julian Straub and Nikhila Ravi and Justin Johnson and Georgia Gkioxari},
-  title =        {{Omni3D}: A Large Benchmark and Model for {3D} Object Detection in the Wild},
-  booktitle =    {CVPR},
-  address =      {Vancouver, Canada},
-  month =        {June},
-  year =         {2023},
-  organization = {IEEE},
-}
+```bash
+python tools/build_gt2d_oracle_json.py \
+    --val datasets/Omni3D/WildBox_val_paper.json \
+    --out datasets/Omni3D/WildBox_val_paper_gt2d.json
+bash tools/run_gt2d_zs_eval.sh
 ```
 
-```BibTex
-@inproceedings{Geiger2012CVPR,
-  author = {Andreas Geiger and Philip Lenz and Raquel Urtasun},
-  title = {Are we ready for Autonomous Driving? The KITTI Vision Benchmark Suite},
-  booktitle = {CVPR},
-  year = {2012}
-}
-``` 
+Geometric baseline (LIFT vs GEO comparison):
 
-```BibTex
-@inproceedings{caesar2020nuscenes,
-  title={nuscenes: A multimodal dataset for autonomous driving},
-  author={Caesar, Holger and Bankiti, Varun and Lang, Alex H and Vora, Sourabh and Liong, Venice Erin and Xu, Qiang and Krishnan, Anush and Pan, Yu and Baldan, Giancarlo and Beijbom, Oscar},
-  booktitle={CVPR},
-  year={2020}
-}
+```bash
+bash tools/run_ovmono3d_geo_wildbox.sh
 ```
 
-```BibTex
-@inproceedings{song2015sun,
-  title={Sun rgb-d: A rgb-d scene understanding benchmark suite},
-  author={Song, Shuran and Lichtenberg, Samuel P and Xiao, Jianxiong},
-  booktitle={CVPR},
-  year={2015}
-}
-```
+---
 
-```BibTex
-@inproceedings{dehghan2021arkitscenes,
-  title={{ARK}itScenes - A Diverse Real-World Dataset for 3D Indoor Scene Understanding Using Mobile {RGB}-D Data},
-  author={Gilad Baruch and Zhuoyuan Chen and Afshin Dehghan and Tal Dimry and Yuri Feigin and Peter Fu and Thomas Gebauer and Brandon Joffe and Daniel Kurz and Arik Schwartz and Elad Shulman},
-  booktitle={NeurIPS Datasets and Benchmarks Track (Round 1)},
-  year={2021},
-}
-```
+## Repo origin and licensing
 
-```BibTex
-@inproceedings{hypersim,
-  author    = {Mike Roberts AND Jason Ramapuram AND Anurag Ranjan AND Atulit Kumar AND
-                 Miguel Angel Bautista AND Nathan Paczan AND Russ Webb AND Joshua M. Susskind},
-  title     = {{Hypersim}: {A} Photorealistic Synthetic Dataset for Holistic Indoor Scene Understanding},
-  booktitle = {ICCV},
-  year      = {2021},
-}
-```
-
-```BibTex
-@article{objectron2021,
-  title={Objectron: A Large Scale Dataset of Object-Centric Videos in the Wild with Pose Annotations},
-  author={Ahmadyan, Adel and Zhang, Liangkai and Ablavatski, Artsiom and Wei, Jianing and Grundmann, Matthias},
-  journal={CVPR},
-  year={2021},
-}
-```
-
-</details>
-
-
-[jy]: https://yaojin17.github.io
-[hg]: https://www.linkedin.com/in/hao--gu/
-[xc]: https://xuweiyichen.github.io/
-[jw]: https://pwang.pw/
-[zc]: https://sites.google.com/site/zezhoucheng/
-
+This repo is a fork of [OVMono3D by Yao et al.](https://github.com/UVA-Computer-Vision-Lab/ovmono3d)
+The architecture, the Cube R-CNN backbone, and the open-vocabulary 2D detector
+integration are all from upstream — see `ORIGINAL_OVMONO3D_README.md` for full
+attribution. The contributions in this fork are: WildBox dataset configs, the
+6-species curriculum training schedule, the BEV / Rel-AP3D / NHD eval scripts,
+and the multi-seed orchestration. License is unchanged from upstream
+(see `LICENSE`).
