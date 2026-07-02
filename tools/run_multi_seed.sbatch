@@ -23,9 +23,9 @@
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 
-# Activate env (adjust if your conda root differs)
-source /storage3/3DOM/vshukla/envs/ovmono3d/bin/activate 2>/dev/null || \
-  conda activate /storage3/3DOM/vshukla/envs/ovmono3d
+# Activate env (adjust the path below to point at your local OVMono3D conda env)
+source "${OVMONO3D_ENV:-$HOME/envs/ovmono3d}/bin/activate" 2>/dev/null || \
+  conda activate "${OVMONO3D_ENV:-ovmono3d}"
 
 # Defer to the bash orchestrator; inherit env overrides from caller
 #   sbatch --export=CONFIG=...,SEEDS="0 1 2" tools/run_multi_seed.sbatch

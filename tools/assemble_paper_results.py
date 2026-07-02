@@ -439,8 +439,8 @@ def main():
         doc.append(f"- git commit: `{commit}`{' (working tree DIRTY)' if dirty else ''}")
     except Exception:
         pass
-    doc.append("- env: `/storage3/3DOM/vshukla/envs/ovmono3d` (Python 3.8.20, PyTorch 2.4.1+cu121)")
-    doc.append("- hardware: 1× NVIDIA A40 (node81)")
+    doc.append("- env: Python 3.8.20, PyTorch 2.4.1+cu121")
+    doc.append("- hardware: 1× NVIDIA A40")
     doc.append("")
     doc.append("Per-run config snapshots are at `<run_dir>/config.yaml` for each section above.")
 
