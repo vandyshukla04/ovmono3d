@@ -156,12 +156,18 @@ def main() -> int:
           f"{float(z):.2e}")
 
     print("\n=== B2: the labelled jsons ===")
-    for name, want in (("WildBox_train_paper.json", args.expect_train),
-                       ("WildBox_val_paper.json", args.expect_val)):
-        p = args.labelled_dir / name
-        if not p.is_file():
-            check(f"T8 {name} exists", False, f"missing at {p}")
+    # the released paper jsons are WildBox_{train,val}_paper.json; the cluster copies are
+    # WildBox_{train,val}.json. Accept either rather than failing on a filename.
+    for split, want in (("train", args.expect_train), ("val", args.expect_val)):
+        cands = [args.labelled_dir / f"WildBox_{split}_paper.json",
+                 args.labelled_dir / f"WildBox_{split}.json"]
+        found = [c for c in cands if c.is_file()]
+        if not found:
+            check(f"T8 a labelled {split} json exists", False,
+                  "tried " + " and ".join(c.name for c in cands) + f" in {args.labelled_dir}")
             continue
+        p = found[0]
+        name = p.name
         d = json.loads(p.read_text())
         by_id = {im["id"]: im for im in d["images"]}
         stamped = sum("heading_alpha" in a for a in d["annotations"])
@@ -171,7 +177,7 @@ def main() -> int:
         check(f"T8 {name}: EVERY annotation stamped", stamped == len(d["annotations"]),
               f"{stamped:,}/{len(d['annotations']):,}")
         check(f"T8 {name}: labelled count", valid == want, f"{valid:,} (expected {want:,})")
-        if name.startswith("WildBox_train"):
+        if split == "train":
             check("T8 no lock video carries a TRAIN label", not locks, str(sorted(locks)))
 
     n_fail = sum(not ok for _, ok in _results)
