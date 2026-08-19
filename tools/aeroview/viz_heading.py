@@ -42,6 +42,13 @@ The Omni3D convention is dims = [W, H, L] with H on the box's local Y, so `R_cam
 axis. Measured over 2,491 val frames, every box in a frame agrees on that axis to **0.00 degrees** -- it is a
 per-segment constant. So `up` is recoverable EXACTLY from any single annotation, and this tool needs no
 VGGT artefact, no cameras.json and no tracking_summary.json.
+
+*** SIGN (this was a real bug, caught by eye before it was caught by any check) ***
+`R_cam[:, 1]` is -up, NOT up: measured over all 7,460 labelled val annotations it points AWAY from the camera
+in 100.0% of cases (mean dot with the animal->camera direction -0.286, zero positives). The pipeline's own
+basis signs up TOWARDS the camera (`frame.sign_up_toward_camera`). Getting this backwards flips `s = up x r`,
+which inverts the arrow's LEFT/RIGHT component while leaving the printed flank label -- computed from
+sin(alpha) directly -- correct. So the picture disagrees with its own caption, and nothing else catches it.
 """
 from __future__ import annotations
 
@@ -82,15 +89,45 @@ def flank_of(alpha: float) -> str:
     return "L" if math.sin(alpha) > 0 else "R"
 
 
+
+def cuboid_edges(corners: np.ndarray):
+    """The 12 edges of a cuboid from its 8 corners, without assuming a corner ordering.
+    Every vertex of a box has exactly 3 neighbours (its 3 axis-aligned neighbours), so joining each
+    corner to its 3 nearest peers yields exactly the 12 edges whatever order the corners arrive in."""
+    D = np.linalg.norm(corners[:, None, :] - corners[None, :, :], axis=-1)
+    np.fill_diagonal(D, np.inf)
+    E = set()
+    for i in range(8):
+        for j in np.argsort(D[i])[:3]:
+            E.add((min(i, int(j)), max(i, int(j))))
+    return sorted(E)
+
+
+def draw_cuboid(ax, corners_cam, K, colour, lw=1.0, alpha=0.85):
+    """Project the 8 camera-space corners and stroke the 12 edges."""
+    c = np.asarray(corners_cam, float)
+    if c.shape != (8, 3) or np.any(c[:, 2] <= 1e-6):
+        return False
+    uv = (K @ c.T).T
+    uv = uv[:, :2] / uv[:, 2:3]
+    for i, j in cuboid_edges(c):
+        ax.plot([uv[i, 0], uv[j, 0]], [uv[i, 1], uv[j, 1]],
+                color=colour, lw=lw, alpha=alpha, solid_capstyle="round")
+    return True
+
+
 # ---------------------------------------------------------------------------------------------------
-def draw(ax, box, alpha, p_cam, up_cam, K, colour, label, *, lw=2.0):
+def draw(ax, box, alpha, p_cam, up_cam, K, colour, label, *, lw=2.0, corners=None, mode='both'):
     import matplotlib.patches as mp
 
     x1, y1, x2, y2 = box
     usable = abs(math.sin(alpha)) >= USABLE_SIN
-    ax.add_patch(mp.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False,
-                              edgecolor=colour, linewidth=lw,
-                              linestyle="-" if usable else (0, (4, 3))))
+    if mode in ("2d", "both"):
+        ax.add_patch(mp.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False,
+                                  edgecolor=colour, linewidth=lw,
+                                  linestyle="-" if usable else (0, (4, 3))))
+    if mode in ("3d", "both") and corners is not None:
+        draw_cuboid(ax, corners, K, colour, lw=lw * 0.7)
 
     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     d = allocentric_dir(alpha, np.asarray(p_cam, float), np.asarray(up_cam, float))
@@ -130,6 +167,14 @@ def main() -> int:
                          "actually verify with.")
     ap.add_argument("--crop-pad", type=float, default=1.8, help="crop size as a multiple of the box")
     ap.add_argument("--crop-cols", type=int, default=6)
+    ap.add_argument("--no-context", action="store_true",
+                    help="do NOT draw the unlabelled GT animals. Only ~11%% of val annotations carry a "
+                         "heading label, so without context boxes most animals in a frame are unmarked and "
+                         "the eye lands on an unboxed one and reads the picture as misaligned.")
+    ap.add_argument("--boxes", choices=["2d", "3d", "both"], default="both",
+                    help="2D box, projected 3D cuboid, or both. The 3D cuboid is the detector's actual "
+                         "output; the 2D box is what localises the animal for the badge. NOTE the cuboid's "
+                         "own front/back is meaningless (PCA sign is arbitrary) -- the ARROW is the heading.")
     args = ap.parse_args()
 
     d = json.loads(args.gt.read_text())
@@ -178,26 +223,40 @@ def main() -> int:
         ax.imshow(arr)
         ax.set_axis_off()
 
+        # context: every OTHER annotated animal, dim, so an unlabelled animal is never mistaken for
+        # a misplaced box (only ~11% of val annotations carry a heading label)
+        if not args.no_context:
+            import matplotlib.patches as mp
+            for a in anns[iid]:
+                if a.get("heading_valid", 0):
+                    continue
+                x, y, w, h = a["bbox"]
+                ax.add_patch(mp.Rectangle((x, y), w, h, fill=False,
+                                          edgecolor="#7FB2FF", linewidth=0.9, alpha=0.55))
+                ax.text(x, y - 3, "unlabelled", color="#7FB2FF", fontsize=5.5, alpha=0.85)
+
         for a in anns[iid]:
             if not a.get("heading_valid", 0):
                 continue
-            up = np.array(a["R_cam"], dtype=float)[:, 1]      # exact, see module docstring
+            up = -np.array(a["R_cam"], dtype=float)[:, 1]     # NOTE the minus: R_cam[:,1] is -up
             x, y, w, h = a["bbox"]
             draw(ax, (x, y, x + w, y + h), float(a["heading_alpha"]),
-                 a["center_cam"], up, K, "#39FF6A", "GT")
+                 a["center_cam"], up, K, "#39FF6A", "GT",
+                 corners=a.get("bbox3D_cam"), mode=args.boxes)
 
         if preds is not None:
             up_ref = None
             for a in anns[iid]:
-                up_ref = np.array(a["R_cam"], dtype=float)[:, 1]
+                up_ref = -np.array(a["R_cam"], dtype=float)[:, 1]
                 break
             for p in preds.get(iid, []):
                 if p.get("score", 0) < args.score_thresh or "alpha" not in p:
                     continue
                 x, y, w, h = p["bbox"]
-                up_p = np.array(p["pose"], dtype=float)[:, 1] if "pose" in p else up_ref
+                up_p = -np.array(p["pose"], dtype=float)[:, 1] if "pose" in p else up_ref
                 draw(ax, (x, y, x + w, y + h), float(p["alpha"]),
-                     p["center_cam"], up_p, K, "#FF3DCB", f"P{p['score']:.2f}", lw=1.6)
+                     p["center_cam"], up_p, K, "#FF3DCB", f"P{p['score']:.2f}", lw=1.6,
+                     corners=p.get("bbox3D"), mode=args.boxes)
 
         name = "__".join(im["file_path"].replace("\\", "/").split("/")[-3:]).replace(".jpg", "")
         fig.savefig(args.out / f"{name}.png", bbox_inches="tight", pad_inches=0)
@@ -221,7 +280,7 @@ def main() -> int:
                     continue
                 x, y, w, h = a["bbox"]
                 cells.append((arr, (x, y, x + w, y + h), float(a["heading_alpha"]),
-                              a["center_cam"], np.array(a["R_cam"], float)[:, 1], K,
+                              a["center_cam"], -np.array(a["R_cam"], float)[:, 1], K,
                               a.get("category_name", "?")))
         if cells:
             cols = args.crop_cols
