@@ -196,6 +196,9 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_Z = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DIMS = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_POSE = 1.0
+    # Allocentric orientation (alpha). Masked to the ~5.8% of annotations carrying a heading
+    # label, so it is an auxiliary term. 0.0 disables the head's loss entirely.
+    cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_ALPHA = 1.0
 
     cfg.MODEL.DLA = CN()
 

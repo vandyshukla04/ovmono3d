@@ -1169,6 +1169,11 @@ def instances_to_coco_json(instances, img_id):
         dimensions = np.ones([num_instances, 3]).tolist()
         pose = np.ones([num_instances, 3, 3]).tolist()
 
+    # allocentric heading. This dict is a hardcoded whitelist, so a field absent here is silently
+    # dropped from instances_predictions.pth and the orientation head becomes ungradeable offline.
+    alpha = (instances.pred_alpha.tolist() if hasattr(instances, "pred_alpha")
+             else np.zeros([num_instances]).tolist())
+
     results = []
     for k in range(num_instances):
         result = {
@@ -1182,6 +1187,7 @@ def instances_to_coco_json(instances, img_id):
             "center_2D": center_2D[k],
             "dimensions": dimensions[k],
             "pose": pose[k],
+            "alpha": alpha[k],
         }
 
         results.append(result)

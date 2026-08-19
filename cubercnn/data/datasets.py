@@ -369,8 +369,11 @@ def load_omni3d_json(json_file, image_root, dataset_name, filter_settings, filte
 
     # annotation keys to pass along
     ann_keys = [
-        "bbox", "bbox3D_cam", "bbox2D_proj", "bbox2D_trunc", "bbox2D_tight", 
+        "bbox", "bbox3D_cam", "bbox2D_proj", "bbox2D_trunc", "bbox2D_tight",
         "center_cam", "dimensions", "pose", "R_cam", "category_id",
+        # orientation supervision (tools/aeroview/build_heading_labels.py stamps EVERY annotation, so the
+        # `if key in anno` filter below can never silently drop these and the mapper can never KeyError)
+        "heading_alpha", "heading_valid",
     ]
     
     # optional per image keys to pass if exists

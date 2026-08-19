@@ -84,6 +84,24 @@ def transform_instance_annotations(annotation, transforms, *, K):
     annotation["bbox"] = bbox
     annotation["bbox_mode"] = BoxMode.XYXY_ABS
 
+    # ---- orientation label under horizontal flip -------------------------------------------------
+    # alpha = atan2(d.s, d.r) with s = up x r. A camera-x mirror M sends s -> -Ms, so alpha -> -alpha:
+    # cos(alpha) (the head/tail bit) SURVIVES but sin(alpha) (the LEFT/RIGHT flank bit) INVERTS.
+    # RANDOM_FLIP defaults to "horizontal" (config.py:237) and no config overrides it, so without this
+    # the flank supervision is 50/50 self-contradictory and the head simply drives sin(alpha) -> 0.
+    # This failure is invisible in the training log.
+    #
+    # MUST stay OUTSIDE the `center_cam[2] != 0` guard below: the existing pose-mirror block is nested
+    # inside it and would silently skip any labelled annotation with a zero-depth centre.
+    #
+    # NOTE: never derive alpha from annotation['pose'] instead. cubercnn's pose mirror `_M1 @ R @ _M2`
+    # is NOT the geometric mirror `M @ R @ M` -- it differs by exactly 180 degrees about the box's own
+    # height axis (a head/tail swap), which every metric in this repo is blind to.
+    if "heading_alpha" in annotation:
+        for transform in transforms:
+            if isinstance(transform, T.HFlipTransform):
+                annotation["heading_alpha"] = -float(annotation["heading_alpha"])
+
     if annotation['center_cam'][2] != 0:
 
         # project the 3D box annotation XYZ_3D to screen 
@@ -140,7 +158,12 @@ def annotations_to_instances(annos, image_size, unknown_categories):
     target.gt_boxes = Boxes([BoxMode.convert(obj["bbox"], obj["bbox_mode"], BoxMode.XYXY_ABS) for obj in annos])
     target.gt_boxes3D = torch.FloatTensor([anno['center_cam_proj'] + anno['dimensions'] + anno['center_cam'] for anno in annos])
     target.gt_poses = torch.FloatTensor([anno['pose'] for anno in annos])
-    
+
+    # orientation supervision. The `gt_` prefix is MANDATORY: add_ground_truth_to_proposals drops any
+    # other field, and roi_heads.py:936-940 re-attaches only `gt_*`.
+    target.gt_heading_alpha = torch.FloatTensor([float(anno.get('heading_alpha', 0.0)) for anno in annos])
+    target.gt_heading_valid = torch.FloatTensor([float(anno.get('heading_valid', 0)) for anno in annos])
+
     n = len(target.gt_classes)
 
     # do keypoints?

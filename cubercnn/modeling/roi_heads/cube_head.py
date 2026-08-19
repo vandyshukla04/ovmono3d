@@ -60,6 +60,12 @@ class CubeHead(nn.Module):
             if self.use_conf:
                 self.feature_generator_conf = nn.Sequential()
 
+        # Orientation (allocentric alpha) gets its OWN trunk in BOTH modes. SHARED_FC is True in the
+        # wildlife6 recipe, so hanging alpha off the shared trunk would send orientation gradients into
+        # the features the pose/dims/z heads use -- i.e. the promise to leave the existing losses
+        # untouched would be false. This branch is ~1 fc layer and is masked to ~5.8% of annotations.
+        self.feature_generator_alpha = nn.Sequential()
+
         # create fully connected layers for Cube Head
         for k, fc_dim in enumerate(fc_dims):
             
@@ -67,12 +73,18 @@ class CubeHead(nn.Module):
             
             self._output_size = fc_dim
 
+            # alpha's own trunk, built in both modes (see the note where it is declared)
+            fc = nn.Linear(fc_dim_in, fc_dim)
+            weight_init.c2_xavier_fill(fc)
+            self.feature_generator_alpha.add_module("fc{}".format(k + 1), fc)
+            self.feature_generator_alpha.add_module("fc_relu{}".format(k + 1), nn.ReLU())
+
             if self.shared_fc:
                 fc = nn.Linear(fc_dim_in, fc_dim)
                 weight_init.c2_xavier_fill(fc)
                 self.feature_generator.add_module("fc{}".format(k + 1), fc)
                 self.feature_generator.add_module("fc_relu{}".format(k + 1), nn.ReLU())
-            
+
             else:
                 
                 fc = nn.Linear(fc_dim_in, fc_dim)
@@ -144,14 +156,25 @@ class CubeHead(nn.Module):
             nn.init.normal_(self.bbox_3D_uncertainty.weight, std=0.001)
             nn.init.constant_(self.bbox_3D_uncertainty.bias, 5)
 
+        # Allocentric orientation, as the unnormalised (cos alpha, sin alpha) pair. Deliberately NOT
+        # multiplied by output_multiple_factor: orientation is species-agnostic (the heading project
+        # merges zebra while the detector splits plains/grevys), and a per-class head would also break
+        # warm-starting the way DIMS_PRIORS does.
+        self.bbox_3D_alpha = nn.Linear(self._output_size, 2)
+        nn.init.normal_(self.bbox_3D_alpha.weight, std=0.001)
+        nn.init.constant_(self.bbox_3D_alpha.bias, 0)
+
 
     def forward(self, x, num_boxes_per_image: Optional[List[int]] = None):
     
         n = x.shape[0]
-        
+
         box_z = None
         box_uncert = None
         box_2d_deltas = None
+
+        # orientation, from its own trunk in both shared_fc modes
+        box_alpha = self.bbox_3D_alpha(self.feature_generator_alpha(x))
 
         if self.shared_fc:
             features = self.feature_generator(x)
@@ -201,7 +224,7 @@ class CubeHead(nn.Module):
             else:
                 box_z = box_z.view(n, -1)
             
-        return box_2d_deltas, box_z, box_dims, box_pose, box_uncert
+        return box_2d_deltas, box_z, box_dims, box_pose, box_uncert, box_alpha
 
 
 def build_cube_head(cfg, input_shape: Dict[str, ShapeSpec]):

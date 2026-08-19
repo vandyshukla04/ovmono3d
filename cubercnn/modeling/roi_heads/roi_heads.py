@@ -52,6 +52,7 @@ class ROIHeads3D(StandardROIHeads):
         loss_w_dims: float,
         loss_w_pose: float,
         loss_w_joint: float,
+        loss_w_alpha: float,
         use_confidence: float,
         inverse_z_weight: bool,
         z_type: str,
@@ -88,6 +89,7 @@ class ROIHeads3D(StandardROIHeads):
         self.loss_w_dims = loss_w_dims
         self.loss_w_pose = loss_w_pose
         self.loss_w_joint = loss_w_joint
+        self.loss_w_alpha = loss_w_alpha
 
         # loss modes
         self.disentangled_loss = disentangled_loss
@@ -188,6 +190,7 @@ class ROIHeads3D(StandardROIHeads):
             'loss_w_dims': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_DIMS,
             'loss_w_pose': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_POSE,
             'loss_w_joint': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_JOINT,
+            'loss_w_alpha': cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_ALPHA,
             'z_type': cfg.MODEL.ROI_CUBE_HEAD.Z_TYPE,
             'pose_type': cfg.MODEL.ROI_CUBE_HEAD.POSE_TYPE,
             'dims_priors_enabled': cfg.MODEL.ROI_CUBE_HEAD.DIMS_PRIORS_ENABLED,
@@ -350,6 +353,15 @@ class ROIHeads3D(StandardROIHeads):
             gt_boxes3D = torch.cat([p.gt_boxes3D for p in proposals], dim=0,)
             gt_poses = torch.cat([p.gt_poses for p in proposals], dim=0,)
 
+            # orientation supervision, sparse: only ~5.8% of train annotations carry a heading label,
+            # so gt_heading_valid is the mask that keeps the loss off everything else.
+            gt_heading_alpha = (torch.cat([p.gt_heading_alpha for p in proposals], dim=0)
+                                if len(proposals) and proposals[0].has('gt_heading_alpha')
+                                else torch.zeros_like(gt_poses[:, 0, 0]))
+            gt_heading_valid = (torch.cat([p.gt_heading_valid for p in proposals], dim=0)
+                                if len(proposals) and proposals[0].has('gt_heading_valid')
+                                else torch.zeros_like(gt_poses[:, 0, 0]))
+
             assert len(gt_poses) == len(gt_boxes3D) == len(box_classes)
         
         # eval on all instances
@@ -427,7 +439,7 @@ class ROIHeads3D(StandardROIHeads):
         pred_src_y = (pred_src_boxes[:, 3] + pred_src_boxes[:, 1]) * 0.5
         
         # forward predictions
-        cube_2d_deltas, cube_z, cube_dims, cube_pose, cube_uncert = self.cube_head(cube_features, num_boxes_per_image)
+        cube_2d_deltas, cube_z, cube_dims, cube_pose, cube_uncert, cube_alpha = self.cube_head(cube_features, num_boxes_per_image)
         
         # simple indexing re-used commonly for selection purposes
         fg_inds = torch.arange(n)
@@ -791,6 +803,24 @@ class ROIHeads3D(StandardROIHeads):
                 if valid_joint.any():
                     losses.update({prefix + 'loss_joint': self.safely_reduce_losses(loss_joint[valid_joint]) * self.loss_w_joint * self.loss_w_3d})
 
+            # ---- masked allocentric orientation loss -------------------------------------------------
+            # Regress the unit vector (cos alpha, sin alpha) rather than the angle: it is continuous at
+            # +/-pi, needs no wrapping, and is exactly what is stored on disk. Cosine-style L2 on the
+            # L2-normalised prediction makes the loss depend only on direction, not magnitude.
+            #
+            # The `if mask.any()` guard follows the loss_joint idiom two lines above and is REQUIRED:
+            # with ~5.8% label coverage many batches carry no labelled RoI at all, and reducing an empty
+            # tensor yields NaN, which the training loop turns into an endless restart.
+            if self.loss_w_alpha > 0:
+                alpha_mask = gt_heading_valid > 0
+                if alpha_mask.any():
+                    pred_a = F.normalize(cube_alpha[alpha_mask], dim=1)
+                    tgt_a = torch.stack((torch.cos(gt_heading_alpha[alpha_mask]),
+                                         torch.sin(gt_heading_alpha[alpha_mask])), dim=1)
+                    loss_alpha = (1.0 - (pred_a * tgt_a).sum(dim=1))
+                    losses.update({prefix + 'loss_alpha':
+                                   self.safely_reduce_losses(loss_alpha) * self.loss_w_alpha})
+
             
         '''
         Inference
@@ -811,14 +841,16 @@ class ROIHeads3D(StandardROIHeads):
         cube_3D = cube_3D.split(num_boxes_per_image)
         cube_pose = cube_pose.split(num_boxes_per_image)
         box_classes = box_classes.split(num_boxes_per_image)
+        # allocentric heading, as a single wrapped angle in radians
+        cube_alpha_ang = torch.atan2(cube_alpha[:, 1], cube_alpha[:, 0]).split(num_boxes_per_image)
         
         pred_instances = None
         
         pred_instances = instances if not self.training else \
             [Instances(image_size) for image_size in im_current_dims]
 
-        for cube_3D_i, cube_pose_i, instances_i, K, im_dim, im_scale_ratio, box_classes_i, pred_boxes_i in \
-            zip(cube_3D, cube_pose, pred_instances, Ks, im_current_dims, im_scales_ratio, box_classes, pred_boxes):
+        for cube_3D_i, cube_pose_i, instances_i, K, im_dim, im_scale_ratio, box_classes_i, pred_boxes_i, cube_alpha_i in \
+            zip(cube_3D, cube_pose, pred_instances, Ks, im_current_dims, im_scales_ratio, box_classes, pred_boxes, cube_alpha_ang):
             
             # merge scores if they already exist
             if hasattr(instances_i, 'scores'):
@@ -841,6 +873,7 @@ class ROIHeads3D(StandardROIHeads):
             instances_i.pred_center_2D = cube_3D_i[:, 6:8]
             instances_i.pred_dimensions = cube_3D_i[:, 3:6]
             instances_i.pred_pose = cube_pose_i
+            instances_i.pred_alpha = cube_alpha_i
 
         if self.training:
             return pred_instances, losses
