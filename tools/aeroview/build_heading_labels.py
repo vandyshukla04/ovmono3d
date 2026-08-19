@@ -1,10 +1,13 @@
 """Stamp `heading_alpha` / `heading_valid` onto every WildBox annotation.  [CPU, minutes]
 
+    # normal use -- the 0.15 MB label bundle ships with the repo, so no data transfer is needed
     python tools/aeroview/build_heading_labels.py \
-        --heading-dir /mnt/d/detany3d/heading \
-        --train /mnt/d/3DBOX/papersubdata/WildBox_train_paper.json \
-        --val   /mnt/d/3DBOX/papersubdata/WildBox_val_paper.json \
-        --out-dir /mnt/d/aeroview/labelled
+        --train datasets/Omni3D/WildBox_train.json \
+        --val   datasets/Omni3D/WildBox_val.json \
+        --out-dir datasets/Omni3D
+
+    # only to regenerate the bundle from the full 508 MB crop files
+    python tools/aeroview/build_heading_labels.py --heading-dir /mnt/d/detany3d/heading ...
 
 WHAT THIS IS FOR
 ----------------
@@ -48,6 +51,22 @@ import numpy as np
 # The two videos carrying the 5,542 human face locks. They are the (secondary) grading set, so no label
 # from them may ever carry a gradient -- see trap 3.
 LOCK_VIDEOS = {"DJI_20250802085130_0007_V", "DJI_20250802085520_0008_V"}
+
+
+def _load_bundle(path: Path):
+    """The stripped label bundle shipped with the repo: 0.15 MB instead of 508 MB of crop JPEGs.
+
+    The three crops_*.npz files are ~508 MB, of which the fields this join actually needs are 8 MB --
+    the rest is encoded crop imagery used only by the DINOv3 template. So the labels travel with the
+    code and the cluster needs no separate data transfer.
+    """
+    with np.load(path, allow_pickle=True) as z:
+        out = {}
+        for tag in ("motion", "standing", "gold"):
+            keys = list(zip(z[f"{tag}_video"].astype(str), z[f"{tag}_seg"].astype(str),
+                            z[f"{tag}_track"].astype(int).tolist(), z[f"{tag}_image"].astype(str)))
+            out[tag] = dict(zip(keys, z[f"{tag}_alpha"].astype(float).tolist()))
+    return out["motion"], out["standing"], out["gold"]
 
 
 def _load_crops(path: Path):
@@ -118,7 +137,13 @@ def stamp(json_path: Path, labels: dict, out_path: Path, *, split: str, verbose=
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--heading-dir", type=Path, default=Path("/mnt/d/detany3d/heading"))
+    ap.add_argument("--bundle", type=Path,
+                    default=Path(__file__).resolve().parent / "data" / "heading_labels_min.npz",
+                    help="stripped label bundle shipped with the repo (default). Use --heading-dir to "
+                         "rebuild from the full crops_*.npz instead.")
+    ap.add_argument("--heading-dir", type=Path, default=None,
+                    help="directory holding crops.npz / crops_stand.npz / crops_human.npz. Only needed "
+                         "to regenerate labels from source; the bundle is normally enough.")
     ap.add_argument("--train", type=Path, required=True)
     ap.add_argument("--val", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
@@ -127,9 +152,17 @@ def main() -> int:
     ap.add_argument("--no-assert", action="store_true", help="report counts but do not enforce them")
     args = ap.parse_args()
 
-    motion = _load_crops(args.heading_dir / "crops.npz")
-    stand = _load_crops(args.heading_dir / "crops_stand.npz")
-    gold = _load_crops(args.heading_dir / "crops_human.npz")
+    if args.heading_dir is not None:
+        motion = _load_crops(args.heading_dir / "crops.npz")
+        stand = _load_crops(args.heading_dir / "crops_stand.npz")
+        gold = _load_crops(args.heading_dir / "crops_human.npz")
+        print(f"source: {args.heading_dir}")
+    else:
+        if not args.bundle.is_file():
+            raise SystemExit(f"bundle not found: {args.bundle}\n"
+                             f"pass --heading-dir <dir with crops*.npz> to rebuild from source.")
+        motion, stand, gold = _load_bundle(args.bundle)
+        print(f"source: {args.bundle} (stripped bundle)")
     print(f"loaded  motion {len(motion):,}  standing {len(stand):,}  gold {len(gold):,}")
 
     # union, motion preferred over standing where a key appears in both
