@@ -378,7 +378,7 @@ def load_omni3d_json(json_file, image_root, dataset_name, filter_settings, filte
     
     # optional per image keys to pass if exists
     # this property is unique to KITTI. 
-    img_keys_optional = ['p2']
+    img_keys_optional = ['p2', 'geo']   # geo = [fx_tel_px, pitch_rad, pitch_valid] stamped by tools/aeroview/stamp_geometry.py
 
     invalid_count = 0
     

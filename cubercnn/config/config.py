@@ -199,6 +199,10 @@ def get_cfg_defaults(cfg):
     # Allocentric orientation (alpha). Masked to the ~5.8% of annotations carrying a heading
     # label, so it is an auxiliary term. 0.0 disables the head's loss entirely.
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_ALPHA = 1.0
+    # Run-2 geometric token: per-RoI computed scalars (ray via telemetry fx, gimbal pitch, plane-depth
+    # hint, box size) injected ADDITIVELY (zero-init) into the cube head trunks, so a run-1 checkpoint
+    # warm-starts with zero shape mismatches. 0 disables and reproduces run 1 exactly.
+    cfg.MODEL.ROI_CUBE_HEAD.GEO_TOKEN_DIM = 0
 
     cfg.MODEL.DLA = CN()
 

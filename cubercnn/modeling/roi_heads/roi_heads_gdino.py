@@ -92,7 +92,7 @@ class ROIHeads3DGDINO(ROIHeads3D):
             cpu_only=False
         )
 
-    def forward(self, images, features, proposals, Ks, im_scales_ratio, targets=None, category_list=None):
+    def forward(self, images, features, proposals, Ks, im_scales_ratio, targets=None, geos=None, category_list=None):
 
         im_dims = [image.shape[1:] for image in images]
 

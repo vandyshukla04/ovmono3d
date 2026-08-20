@@ -51,6 +51,7 @@ class RCNN3D(GeneralizedRCNN):
 
         # The unmodified intrinsics for the image
         Ks = [torch.FloatTensor(info['K']) for info in batched_inputs]
+        geos = [torch.FloatTensor(info.get('geo', [0.0, 0.0, 0.0])) for info in batched_inputs]
 
         if "instances" in batched_inputs[0]:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
@@ -63,7 +64,7 @@ class RCNN3D(GeneralizedRCNN):
         instances, detector_losses = self.roi_heads(
             images, features, proposals, 
             Ks, im_scales_ratio, 
-            gt_instances
+            gt_instances, geos=geos
         )
 
         if self.vis_period > 0:
@@ -92,22 +93,23 @@ class RCNN3D(GeneralizedRCNN):
         
         # The unmodified intrinsics for the image
         Ks = [torch.FloatTensor(info['K']) for info in batched_inputs]
+        geos = [torch.FloatTensor(info.get('geo', [0.0, 0.0, 0.0])) for info in batched_inputs]
 
         features = self.backbone(images.tensor)
 
         # Pass oracle 2D boxes into the RoI heads
         if type(batched_inputs == list) and np.any(['oracle2D' in b for b in batched_inputs]):
             oracles = [b['oracle2D'] for b in batched_inputs]
-            results, _ = self.roi_heads(images, features, oracles, Ks, im_scales_ratio, None)
+            results, _ = self.roi_heads(images, features, oracles, Ks, im_scales_ratio, None, geos=geos)
         
         # normal inference
         else:
             proposals, _ = self.proposal_generator(images, features, None)
             if np.any(['category_list' in b for b in batched_inputs]):
                 # Gronding DINO inference is only supported to one image at one batch
-                results, _ = self.roi_heads(images, features, proposals, Ks, im_scales_ratio, None, category_list=batched_inputs[0]["category_list"]) 
+                results, _ = self.roi_heads(images, features, proposals, Ks, im_scales_ratio, None, geos=geos, category_list=batched_inputs[0]["category_list"]) 
             else:
-                results, _ = self.roi_heads(images, features, proposals, Ks, im_scales_ratio, None)
+                results, _ = self.roi_heads(images, features, proposals, Ks, im_scales_ratio, None, geos=geos)
 
         if do_postprocess:
             assert not torch.jit.is_scripting(), "Scripting is not supported for postprocess."

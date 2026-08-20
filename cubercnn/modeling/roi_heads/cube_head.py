@@ -156,6 +156,16 @@ class CubeHead(nn.Module):
             nn.init.normal_(self.bbox_3D_uncertainty.weight, std=0.001)
             nn.init.constant_(self.bbox_3D_uncertainty.bias, 5)
 
+        # Run-2 geometric token embed. ADDITIVE and ZERO-INITIALISED so that (a) a run-1 checkpoint
+        # loads with no shape mismatches (no existing layer changes size) and (b) at init the model is
+        # bit-identical to run 1 -- the token's influence grows from exactly zero. One shared embed
+        # feeds both trunks; with GEO_TOKEN_DIM=0 the module is absent and this is run 1.
+        self.geo_token_dim = cfg.MODEL.ROI_CUBE_HEAD.GEO_TOKEN_DIM
+        if self.geo_token_dim > 0:
+            self.token_embed = nn.Linear(self.geo_token_dim, self._output_size)
+            nn.init.zeros_(self.token_embed.weight)
+            nn.init.zeros_(self.token_embed.bias)
+
         # Allocentric orientation, as the unnormalised (cos alpha, sin alpha) pair. Deliberately NOT
         # multiplied by output_multiple_factor: orientation is species-agnostic (the heading project
         # merges zebra while the detector splits plains/grevys), and a per-class head would also break
@@ -165,7 +175,7 @@ class CubeHead(nn.Module):
         nn.init.constant_(self.bbox_3D_alpha.bias, 0)
 
 
-    def forward(self, x, num_boxes_per_image: Optional[List[int]] = None):
+    def forward(self, x, num_boxes_per_image: Optional[List[int]] = None, tau=None):
     
         n = x.shape[0]
 
@@ -173,11 +183,21 @@ class CubeHead(nn.Module):
         box_uncert = None
         box_2d_deltas = None
 
+        # the additive token correction, shared by every trunk (zero at init)
+        tok = None
+        if self.geo_token_dim > 0 and tau is not None:
+            tok = self.token_embed(tau)
+
         # orientation, from its own trunk in both shared_fc modes
-        box_alpha = self.bbox_3D_alpha(self.feature_generator_alpha(x))
+        feats_alpha = self.feature_generator_alpha(x)
+        if tok is not None:
+            feats_alpha = feats_alpha + tok
+        box_alpha = self.bbox_3D_alpha(feats_alpha)
 
         if self.shared_fc:
             features = self.feature_generator(x)
+            if tok is not None:
+                features = features + tok
             box_2d_deltas = self.bbox_3D_center_deltas(features)
             box_dims = self.bbox_3D_dims(features)
             box_pose = self.bbox_3D_pose(features)

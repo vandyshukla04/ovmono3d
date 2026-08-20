@@ -207,7 +207,7 @@ class ROIHeads3D(StandardROIHeads):
         }
 
 
-    def forward(self, images, features, proposals, Ks, im_scales_ratio, targets=None):
+    def forward(self, images, features, proposals, Ks, im_scales_ratio, targets=None, geos=None):
 
         im_dims = [image.shape[1:] for image in images]
 
@@ -329,7 +329,7 @@ class ROIHeads3D(StandardROIHeads):
 
         return proposal_boxes_scaled
     
-    def _forward_cube(self, features, instances, Ks, im_current_dims, im_scales_ratio):
+    def _forward_cube(self, features, instances, Ks, im_current_dims, im_scales_ratio, geos=None):
         
         features = [features[f] for f in self.in_features]
 
@@ -411,6 +411,48 @@ class ROIHeads3D(StandardROIHeads):
 
         im_scales_original_per_box = im_scales_per_box * im_ratios_per_box
 
+        # ---- run-2 geometric token (per RoI, all computed, no labels) ---------------------------
+        # The RoIAlign crop deletes where the box sits and how large it is; the head is otherwise
+        # blind to the true focal length and the camera pitch. tau restores exactly that:
+        #   [ray_x, ray_y, ray_z, log(fx_tel/1000), sin(pitch), cos(pitch), pitch_valid,
+        #    plane_hint, log(h_px), log(w_px)]
+        # fx_tel/pitch come from drone telemetry stamped per image (geo field); plane_hint is
+        # log 1/(-n.d) -- the ground-plane depth up to the unknown height, 0 when pitch is absent.
+        tau = None
+        if getattr(self.cube_head, "geo_token_dim", 0) > 0:
+            dev = cube_features.device
+            geo_rows = []
+            for i, num in enumerate(num_boxes_per_image):
+                g = geos[i] if (geos is not None and geos[i] is not None) else torch.zeros(3)
+                fx_t, pitch, valid = float(g[0]), float(g[1]), float(g[2])
+                fx_s = (fx_t if fx_t > 0 else float(Ks[i][0, 0])) / float(im_scales_ratio[i])
+                K_s = Ks[i] / im_scales_ratio[i]
+                cx_s, cy_s = float(K_s[0, 2]), float(K_s[1, 2])
+                boxes = proposals[i].proposal_boxes.tensor if proposals[i].has("proposal_boxes")                     else proposals[i].pred_boxes.tensor
+                u = (boxes[:, 0] + boxes[:, 2]) / 2.0
+                v = boxes[:, 3]                                      # bottom-centre
+                w_px = (boxes[:, 2] - boxes[:, 0]).clamp(min=1.0)
+                h_px = (boxes[:, 3] - boxes[:, 1]).clamp(min=1.0)
+                d = torch.stack([(u - cx_s) / fx_s, (v - cy_s) / fx_s, torch.ones_like(u)], dim=1)
+                d = d / d.norm(dim=1, keepdim=True)
+                if valid > 0:
+                    n_vec = torch.tensor([0.0, -np.cos(-pitch), -np.sin(-pitch)],
+                                         dtype=d.dtype, device=d.device)
+                    nd = (d.to(n_vec.device) @ n_vec).clamp(max=-1e-4)
+                    plane_hint = torch.log(1.0 / (-nd))
+                    sp, cp, pv = np.sin(pitch), np.cos(pitch), 1.0
+                else:
+                    plane_hint = torch.zeros_like(u)
+                    sp, cp, pv = 0.0, 0.0, 0.0
+                row = torch.stack([
+                    d[:, 0], d[:, 1], d[:, 2],
+                    torch.full_like(u, float(np.log(max(fx_s, 1.0) / 1000.0))),
+                    torch.full_like(u, sp), torch.full_like(u, cp), torch.full_like(u, pv),
+                    plane_hint, torch.log(h_px), torch.log(w_px),
+                ], dim=1)
+                geo_rows.append(row)
+            tau = torch.cat(geo_rows).to(dev)
+
         if self.virtual_depth:
                 
             virtual_to_real = util.compute_virtual_scale_from_focal_spaces(
@@ -439,7 +481,7 @@ class ROIHeads3D(StandardROIHeads):
         pred_src_y = (pred_src_boxes[:, 3] + pred_src_boxes[:, 1]) * 0.5
         
         # forward predictions
-        cube_2d_deltas, cube_z, cube_dims, cube_pose, cube_uncert, cube_alpha = self.cube_head(cube_features, num_boxes_per_image)
+        cube_2d_deltas, cube_z, cube_dims, cube_pose, cube_uncert, cube_alpha = self.cube_head(cube_features, num_boxes_per_image, tau=tau)
         
         # simple indexing re-used commonly for selection purposes
         fg_inds = torch.arange(n)
