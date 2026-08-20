@@ -435,20 +435,29 @@ class ROIHeads3D(StandardROIHeads):
                 h_px = (boxes[:, 3] - boxes[:, 1]).clamp(min=1.0)
                 d = torch.stack([(u - cx_s) / fx_s, (v - cy_s) / fx_s, torch.ones_like(u)], dim=1)
                 d = d / d.norm(dim=1, keepdim=True)
+                # EVERY entry below is standardised to O(1). The first smoke run shipped raw logs
+                # (h_px ~ 4-6, plane hint up to 9.2 on above-horizon rays): token-embed gradients scale
+                # with tau's magnitude, so at warmup LR a couple of updates broke the z pathway and the
+                # skip-guard then froze training permanently. Bounded inputs, or none.
                 if valid > 0:
                     n_vec = torch.tensor([0.0, -np.cos(-pitch), -np.sin(-pitch)],
                                          dtype=d.dtype, device=d.device)
-                    nd = (d.to(n_vec.device) @ n_vec).clamp(max=-1e-4)
-                    plane_hint = torch.log(1.0 / (-nd))
+                    nd = d @ n_vec
+                    ground = nd < -0.02              # ray actually hits the ground ahead
+                    plane_hint = torch.where(
+                        ground, torch.log(1.0 / (-nd).clamp(min=1e-3)), torch.zeros_like(nd))
+                    plane_hint = (plane_hint.clamp(0.0, 4.6) - 1.5) / 1.5   # ~[-1, +2]
                     sp, cp, pv = np.sin(pitch), np.cos(pitch), 1.0
                 else:
                     plane_hint = torch.zeros_like(u)
                     sp, cp, pv = 0.0, 0.0, 0.0
                 row = torch.stack([
                     d[:, 0], d[:, 1], d[:, 2],
-                    torch.full_like(u, float(np.log(max(fx_s, 1.0) / 1000.0))),
+                    torch.full_like(u, float((np.log(max(fx_s, 1.0)) - 8.0) / 2.0)),
                     torch.full_like(u, sp), torch.full_like(u, cp), torch.full_like(u, pv),
-                    plane_hint, torch.log(h_px), torch.log(w_px),
+                    plane_hint,
+                    (torch.log(h_px) - 4.5) / 1.5,
+                    (torch.log(w_px) - 4.5) / 1.5,
                 ], dim=1)
                 geo_rows.append(row)
             tau = torch.cat(geo_rows).to(dev)
