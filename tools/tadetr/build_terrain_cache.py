@@ -125,6 +125,14 @@ def build_one(args_tuple):
         z = np.load(sp.depth_npz)
         depth, conf = z["depth"], z["depth_conf"]
         conf_thresh = max(CONF_MIN, float(np.percentile(conf, 20)))
+        if float((conf >= conf_thresh).mean()) < 0.05:
+            # degenerate-confidence segment (VGGT globally unconfident, conf ~ 1.0 everywhere):
+            # the absolute floor would reject every pixel; fall back to the spec's pure-percentile
+            # rule and mark the segment. H_var's 1/mean-conf inflation + the plane fallback carry
+            # the quality signal downstream.
+            conf_thresh = float(np.percentile(conf, 20))
+            warnings.append(f"conf floor relaxed to p20={conf_thresh:.3f} "
+                            f"(degenerate confidence, max={float(conf.max()):.3f})")
 
         rng = np.random.RandomState(0)
         pts_list, w_list = [], []
