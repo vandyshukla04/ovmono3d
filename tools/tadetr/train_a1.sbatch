@@ -15,4 +15,5 @@ mkdir -p /storage2/3DOM/vshukla/runs/tadetr_a1
 exec $PY tools/tadetr/train_tadetr.py \
   --config configs/tadetr/a1.yaml,configs/tadetr/cluster_paths.yaml \
   --resume \
+  data.num_workers=8 \
   train.out_dir=/storage2/3DOM/vshukla/runs/tadetr_a1
