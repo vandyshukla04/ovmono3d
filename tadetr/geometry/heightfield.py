@@ -28,6 +28,10 @@ class TerrainField:
         self.n_points = torch.as_tensor(np.asarray(cache["n_points"]), device=device)
         self.dtype = dtype
         self.device = device
+        # terrain dropout (training-time, edge-tier robustness): when True, the field degrades to
+        # its own RANSAC plane -- which is EXACTLY h = 0 in the tangent frame (the frame is built
+        # on that plane), with the plane normal everywhere. Toggled per batch by the train loop.
+        self.plane_only = False
 
     def world_to_tangent(self, p_w: torch.Tensor) -> torch.Tensor:
         """(...,3) world -> (...,3) tangent (a, b, h)."""
@@ -47,6 +51,8 @@ class TerrainField:
                 + (grid[i0, j1] * (1 - fa) + grid[i1, j1] * fa) * fb)
 
     def height(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        if self.plane_only:
+            return torch.zeros_like(a)
         return self._bilinear(self.H, a, b)
 
     def var(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -56,6 +62,8 @@ class TerrainField:
         """(...,) tangent coords -> (...,3) unit surface normal in WORLD coordinates,
         from central differences of the height field (surface h = f(a,b):
         normal ~ n - f_a e1 - f_b e2)."""
+        if self.plane_only:
+            return self.R_grid[2].expand(a.shape + (3,))
         eps = self.scale
         fa = (self.height(a + eps, b) - self.height(a - eps, b)) / (2 * eps)
         fb = (self.height(a, b + eps) - self.height(a, b - eps)) / (2 * eps)

@@ -32,7 +32,8 @@ def hungarian_match(logits: torch.Tensor, boxes: torch.Tensor, contact: torch.Te
                     targets: list, w_class: float, w_contact: float, w_giou: float):
     """Per image: logits (Q,C+1), boxes (Q,4 cxcywh), contact (Q,2); targets = list of dicts.
     Returns list of (query_idx, target_idx) LongTensor pairs."""
-    out = []
+    logits, boxes, contact = logits.float(), boxes.float(), contact.float()  # no-grad cost
+    out = []                                       # matrix; cdist has no bf16 CUDA kernel
     for i, tg in enumerate(targets):
         n = len(tg["cls"])
         if n == 0:

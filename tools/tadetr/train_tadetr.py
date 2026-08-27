@@ -69,16 +69,29 @@ def main() -> int:
     print(f"trainable params: {n_train/1e6:.1f}M (backbone frozen)")
     opt = torch.optim.AdamW(trainable, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
     iters_per_epoch = len(sampler)
-    total_iters = cfg.train.epochs * iters_per_epoch
+    # the schedule steps once per OPTIMIZER step (= loader iters / accum), so the horizon must be
+    # counted in optimizer steps or cosine never completes (found in the pre-launch audit)
+    total_opt_steps = max(cfg.train.epochs * iters_per_epoch // cfg.train.accum_steps, 1)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda it: min(1.0, (it + 1) / cfg.train.warmup_iters)
-        * 0.5 * (1 + math.cos(math.pi * min(it / max(total_iters, 1), 1.0))))
+        * 0.5 * (1 + math.cos(math.pi * min(it / total_opt_steps, 1.0))))
+
+    def save_ckpt(path, epoch, it):
+        # frozen backbone excluded: it is 1.2 GB of redundant weights per file; resume rebuilds it
+        # from train.backbone_weights and loads the rest with strict=False
+        slim = {k: v for k, v in model.state_dict().items()
+                if not k.startswith("backbone.vit.")}
+        torch.save({"model": slim, "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "epoch": epoch, "iter": it, "cfg": cfg.dump()}, path)
 
     start_epoch = git = 0
     ckpt_path = out_dir / "last.pth"
     if args.resume and ckpt_path.exists():
         ck = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ck["model"])
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        assert not unexpected, f"unexpected ckpt keys: {unexpected[:5]}"
+        assert all(k.startswith("backbone.vit.") for k in missing), \
+            f"missing non-backbone keys: {[k for k in missing if not k.startswith('backbone.vit.')][:5]}"
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
         start_epoch, git = ck["epoch"], ck["iter"]
@@ -98,7 +111,11 @@ def main() -> int:
             for k in ("image", "bridge", "K", "extrinsic", "cam_height", "telemetry",
                       "cam_feats"):
                 batch[k] = batch[k].to(device, non_blocking=True)
+            batch["targets"] = [{k: (v.to(device) if torch.is_tensor(v) else v)
+                                 for k, v in t.items()} for t in batch["targets"]]
             fields = build_fields(ds, set(batch["seg_key"]), device)
+            for k in set(batch["seg_key"]):     # terrain dropout: degrade to the plane (edge tier)
+                fields[k].plane_only = bool(torch.rand(1).item() < cfg.data.terrain_dropout_p)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 outputs = model(batch, fields, stage=stage)
             losses = criterion(outputs, batch["targets"], stage=stage)
@@ -117,14 +134,9 @@ def main() -> int:
                       f"{main_losses} lr {sched.get_last_lr()[0]:.2e} "
                       f"{(time.time()-t0)/max(git,1):.2f}s/it", flush=True)
             if git % cfg.train.ckpt_every_iters == 0:
-                torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                            "sched": sched.state_dict(), "epoch": epoch, "iter": git,
-                            "cfg": cfg.dump()}, ckpt_path)
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                    "sched": sched.state_dict(), "epoch": epoch + 1, "iter": git,
-                    "cfg": cfg.dump()}, ckpt_path)
-        torch.save({"model": model.state_dict(), "cfg": cfg.dump()},
-                   out_dir / f"epoch_{epoch+1}.pth")
+                save_ckpt(ckpt_path, epoch, git)
+        save_ckpt(ckpt_path, epoch + 1, git)
+        save_ckpt(out_dir / f"epoch_{epoch+1}.pth", epoch + 1, git)
         print(f"epoch {epoch+1} done -> {ckpt_path}", flush=True)
     print("training complete")
     return 0

@@ -86,6 +86,8 @@ class WildBoxTADETR(torch.utils.data.Dataset):
               f"({n_dropped} frames without terrain cache)")
 
     def cache(self, key):
+        if isinstance(key, str):                      # "video||seg" (samples carry strings:
+            key = tuple(key.split("||"))              # pin_memory mangles tuples into lists)
         if key not in self._cache:
             c = load_terrain_cache(self._cache_paths[key])
             c["_frame_index"] = {str(n): i for i, n in enumerate(c["frame_names"])}
@@ -138,7 +140,7 @@ class WildBoxTADETR(torch.utils.data.Dataset):
             "K": torch.from_numpy(K),
             "extrinsic": torch.from_numpy(np.array(c["extrinsics"][fi], np.float32)),
             "cam_height": torch.tensor(cam_h, dtype=torch.float32),
-            "seg_key": key,
+            "seg_key": f"{key[0]}||{key[1]}",
             "image_id": im["id"],
             "telemetry": torch.from_numpy(telemetry),
             "cam_feats": torch.from_numpy(cam_feats),
