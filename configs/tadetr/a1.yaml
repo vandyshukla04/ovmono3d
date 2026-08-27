@@ -1,0 +1,10 @@
+# A1: learned contact + class + box2d; every 3D residual OFF (architecturally A0 + learned contact).
+model:
+  use_height_residual: false
+  use_center_offset: false
+  use_dim_residual: false
+  use_herd_scale: false
+  use_rot_refine: false
+train:
+  epochs: 15
+  out_dir: runs/tadetr_a1

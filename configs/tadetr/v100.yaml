@@ -1,0 +1,6 @@
+# V100-16GB: NO bf16 on Volta; fp16 FORBIDDEN (silently zeroed a ViT-L forward). Full fp32.
+data:
+  segments_per_batch: 1
+train:
+  amp: "off"
+  accum_steps: 4

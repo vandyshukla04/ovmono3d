@@ -70,7 +70,11 @@ def main() -> int:
     ap.add_argument("--val", type=Path, required=True)
     ap.add_argument("--train", type=Path, required=True)
     ap.add_argument("--terrain", type=Path, default=Path("datasets/tadetr/terrain"))
-    ap.add_argument("--mode", choices=["gt2d"], default="gt2d")
+    ap.add_argument("--mode", choices=["gt2d", "gdino"], default="gt2d")
+    ap.add_argument("--gdino-json", type=Path,
+                    default=Path("datasets/Omni3D/gdino_WildBox_val_oracle_2d.json"),
+                    help="gdino mode: per-image detections (image_id join; bbox XYWH, score, "
+                         "category_name) -- the frozen GroundingDINO oracle file, never regenerated")
     ap.add_argument("--out", type=Path, default=Path("datasets/tadetr/runs/a0_gt2d/WildBox_val.pth"))
     ap.add_argument("--unit-report", type=Path,
                     default=Path("datasets/tadetr/reports/terrain_unit_test.json"))
@@ -94,11 +98,24 @@ def main() -> int:
     d = json.loads(args.val.read_text())
     ims = {i["id"]: i for i in d["images"]}
     per_seg = defaultdict(list)
-    for a in d["annotations"]:
-        if a.get("behind_camera"):
-            continue
-        _, video, seg, image = parse_label_path(ims[a["image_id"]]["file_path"])
-        per_seg[(video, seg)].append((image, a))
+    if args.mode == "gt2d":
+        for a in d["annotations"]:
+            if a.get("behind_camera"):
+                continue
+            _, video, seg, image = parse_label_path(ims[a["image_id"]]["file_path"])
+            per_seg[(video, seg)].append((image, a))
+    else:  # gdino: real detections; synthesize gt2d-shaped anns (bbox/score/category only)
+        for rec in json.loads(args.gdino_json.read_text()):
+            im = ims.get(rec["image_id"])
+            if im is None:
+                continue
+            _, video, seg, image = parse_label_path(im["file_path"])
+            for det in rec["instances"]:
+                per_seg[(video, seg)].append((image, {
+                    "image_id": rec["image_id"], "bbox": det["bbox"],
+                    "score": float(det.get("score", 1.0)),
+                    "category_id": det["category_id"], "category_name": det["category_name"],
+                }))
 
     inst_by_img: dict[int, list] = defaultdict(list)
     n_done = n_skip = n_fb = 0
@@ -164,7 +181,7 @@ def main() -> int:
                 "category_id": a["category_id"],
                 "category_name": a["category_name"],
                 "bbox": [float(x) for x in a["bbox"]],
-                "score": 1.0,
+                "score": float(a.get("score", 1.0)),
                 "depth": float(center_cam[2]),
                 "bbox3D": verts.numpy().tolist() if hasattr(verts, "numpy") else np.asarray(verts).tolist(),
                 "center_cam": center_cam.tolist(),

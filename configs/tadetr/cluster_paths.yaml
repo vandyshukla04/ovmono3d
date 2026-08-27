@@ -1,0 +1,6 @@
+data:
+  train_json: datasets/Omni3D/WildBox_train.json
+  val_json: datasets/Omni3D/WildBox_val.json
+  image_root: datasets/wildbox_hf
+train:
+  backbone_weights: /storage3/3DOM/vshukla/DetAny3D/checkpoints/dinov2_vitl14_pretrain.pth

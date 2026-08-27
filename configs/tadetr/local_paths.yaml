@@ -1,0 +1,6 @@
+data:
+  train_json: /mnt/d/aeroview/labelled/WildBox_train_paper.json
+  val_json: /mnt/d/aeroview/labelled/WildBox_val_paper.json
+  image_root: /mnt/d/3DBOX/papersubdata
+train:
+  backbone_weights: /home/shuklva/.cache/torch/hub/checkpoints/dinov2_vitl14_pretrain.pth

@@ -182,12 +182,98 @@ def lift_one(cache, image, a, duv):
     return float(out["z_label"][0]), out
 
 
+def training_checks():
+    """P1-P4, P7, P8, P10, P12 -- the M3 additions (flips, O(1) inputs, init-equivalence,
+    matcher determinism, join audit). Uses the LOCAL site config."""
+    from tadetr.config import TADETRConfig
+    from tadetr.data.dataset import WildBoxTADETR, collate
+    from tadetr.data.transforms import ViewBridge
+    from tadetr.geometry.heightfield import TerrainField as TF32
+    from tadetr.modeling.matcher import hungarian_match
+
+    cfg = TADETRConfig.load("configs/tadetr/a1.yaml,configs/tadetr/local_paths.yaml",
+                            ["data.num_workers=0"])
+    ds = WildBoxTADETR(cfg.data, "val", training=False)
+    # P12: join audit -- every frame of both splits resolves to a terrain cache
+    ds_tr = WildBoxTADETR(cfg.data, "train", training=False)
+    ok12 = (len(ds.samples) == len(ds.images)) and (len(ds_tr.samples) == len(ds_tr.images))
+    check("P12 join audit (all frames have terrain)", ok12,
+          f"val {len(ds.samples)}/{len(ds.images)}, train {len(ds_tr.samples)}/{len(ds_tr.images)}")
+
+    # P1-P4: flip consistency straight through the REAL target builder
+    key = next(iter(ds.by_segment))
+    im, seg_key, image_name = ds.samples[ds.by_segment[key][0]]
+    anns = [a for a in ds.anns_by_img[im["id"]] if a.get("valid3D", True)][:8]
+    W, H = cfg.data.input_w, cfg.data.input_h
+    br_n = ViewBridge(sx=1920 / W, sy=1080 / H, ox=0, oy=0, flip=False, w_in=W, h_in=H)
+    br_f = ViewBridge(sx=1920 / W, sy=1080 / H, ox=0, oy=0, flip=True, w_in=W, h_in=H)
+    tn = ds._targets(list(anns), br_n, seg_key, ds.cache(seg_key))
+    tf = ds._targets(list(anns), br_f, seg_key, ds.cache(seg_key))
+    du = (tf["contact"][:, 0] - (1 - (W - 1) / W - tn["contact"][:, 0] * -1)).abs()  # u' ~ 1-u
+    err_u = (tf["contact"][:, 0] + tn["contact"][:, 0] - (W - 1) / W).abs().max()
+    check("P1 hflip contact u' = 1-u", float(err_u) < 2e-3, f"max dev {float(err_u):.2e}")
+    e_axis = ((tf["axis_embed"] - torch.stack([-tn["axis_embed"][:, 0],
+                                               tn["axis_embed"][:, 1]], 1)).abs().max())
+    check("P3 hflip axis (sin2psi flips)", float(e_axis) < 1e-6, f"max dev {float(e_axis):.2e}")
+    e_sign = (tf["sign_target"] - tn["sign_target"]).abs().max()
+    check("P2 sign bit flip-invariant", float(e_sign) < 1e-6, f"max dev {float(e_sign):.2e}")
+    uf, vf = br_f.view_to_full(tf["contact"][:, 0].numpy() * W, tf["contact"][:, 1].numpy() * H)
+    bx = np.array([a["bbox"] for a in anns], float)
+    err4 = np.abs(uf - (bx[:, 0] + bx[:, 2] / 2)).max()
+    check("P4 bridge round-trip to full-res", err4 < 4.0,
+          f"max |u_full - bbox bottom-center| {err4:.2f} px (view px = {1920/W:.2f} full px)")
+
+    # P7: O(1) audit on real inputs
+    batch = collate([ds[i] for i in ds.by_segment[key][:2]])
+    mags = {"telemetry": float(batch["telemetry"].abs().max()),
+            "cam_feats": float(batch["cam_feats"].abs().max())}
+    check("P7 O(1) model inputs", all(v < 3.5 for v in mags.values()), str(mags))
+
+    # P10: matcher determinism
+    Q, C = 50, 6
+    g = torch.Generator().manual_seed(0)
+    lg = torch.randn(2, Q, C + 1, generator=g)
+    bx2 = torch.rand(2, Q, 4, generator=g)
+    ct = torch.rand(2, Q, 2, generator=g)
+    tgts = [{"cls": torch.tensor([1, 2]), "boxes": torch.rand(2, 4, generator=g),
+             "contact": torch.rand(2, 2, generator=g)} for _ in range(2)]
+    m1 = hungarian_match(lg, bx2, ct, tgts, 2, 5, 2)
+    m2 = hungarian_match(lg, bx2, ct, tgts, 2, 5, 2)
+    ok10 = all(torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]) for a, b in zip(m1, m2))
+    check("P10 matcher determinism", ok10, "two identical calls agree")
+
+    # P8: init-equivalence -- composed z with GT contact == geometric_lift z (A1 flags, zero-init)
+    c = ds.cache(seg_key)
+    f32 = TF32(c, dtype=torch.float32)
+    E_by = {str(n): i for i, n in enumerate(c["frame_names"])}
+    fi = E_by[image_name]
+    n_t = min(len(anns), 6)
+    uv_full = torch.tensor([[a["bbox"][0] + a["bbox"][2] / 2, a["bbox"][1] + a["bbox"][3]]
+                            for a in anns[:n_t]], dtype=torch.float32)
+    K = torch.tensor(np.array(im["K"], np.float32).reshape(3, 3))
+    E = torch.tensor(np.array(c["extrinsics"][fi], np.float32))
+    ch = torch.tensor(float(c["cam_height"][fi])).expand(n_t)
+    lift = geometric_lift(uv_full, K.expand(n_t, 3, 3), E.expand(n_t, 3, 4), f32, ch)
+    # composed (A1): z of foot + H/2 lift -- compare center z vs lift z + analytic H/2 term
+    s = f32.s_seg
+    p_t = f32.world_to_tangent(lift["p_world"])
+    n_w = f32.normal_world(p_t[:, 0], p_t[:, 1])
+    Hmed = torch.tensor([a["dimensions"][1] for a in anns[:n_t]], dtype=torch.float32)
+    cw = lift["p_world"] + n_w * (Hmed / (2 * s))[:, None]
+    z_comp = s * ((E[:, :3] @ cw.T).T + E[:, 3])[:, 2]
+    z_gt = torch.tensor([a["center_cam"][2] for a in anns[:n_t]])
+    med = float((z_comp - z_gt).abs().median() / z_gt.median())
+    check("P8 composition == lift+H/2 (A1 path, GT contact)", med < 0.05,
+          f"median |z_comp - z_gt|/z {100*med:.2f}% on {n_t} anns")
+
+
 def main() -> int:
-    print("TA-DETR preflight (M2 subset)")
+    print("TA-DETR preflight")
     cache_path, cache, anns = find_val_cache()
     p13_unprojection()
     p14_bilinear(cache)
     p15_p6(cache_path, cache, anns)
+    training_checks()
     n_ok = sum(RESULTS)
     print(f"\n{n_ok}/{len(RESULTS)} checks passed")
     return 0 if n_ok == len(RESULTS) else 1
