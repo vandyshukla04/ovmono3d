@@ -193,7 +193,13 @@ class WildBoxTADETR(torch.utils.data.Dataset):
 
         alpha = torch.tensor([float(a.get("heading_alpha", 0.0)) for a in anns])
         hvalid = torch.tensor([float(a.get("heading_valid", 0.0)) for a in anns])
-        sign_target = (torch.cos(alpha - psi) < 0).float()   # flip-invariant (both angles mirror)
+        # THE SIGN BUG (A1 post-mortem, 2026-08-29): the sign bit must be defined against the
+        # CANONICAL axis branch psi_c in (-pi/2, pi/2] -- the SAME branch the export decodes from
+        # (sin 2psi, cos 2psi). Raw psi carries the frame's arbitrary PCA sign; using it made the
+        # training label inverted on the |psi|>pi/2 subpopulation (rhino sign 14.6% = anti-
+        # correlated). Still flip-invariant: alpha and psi_c mirror together under hflip.
+        psi_c = 0.5 * torch.atan2(torch.sin(2 * psi), torch.cos(2 * psi))
+        sign_target = (torch.cos(alpha - psi_c) < 0).float()
         sign_valid = hvalid * valid3d
         return {"cls": cls, "boxes": boxes, "contact": contact, "contact_valid": contact_valid,
                 "center_cam": center, "dims": dims, "valid3d": valid3d, "axis_embed": embed,

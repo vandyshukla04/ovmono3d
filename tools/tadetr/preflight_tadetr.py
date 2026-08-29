@@ -229,6 +229,36 @@ def training_checks():
             "cam_feats": float(batch["cam_feats"].abs().max())}
     check("P7 O(1) model inputs", all(v < 3.5 for v in mags.values()), str(mags))
 
+    # P16: target/export round-trip for orientation -- THE CHECK THAT WOULD HAVE CAUGHT THE A1
+    # SIGN BUG. Decode psi from the axis embed exactly as eval_tadetr does (atan2(s2,c2)/2, the
+    # canonical branch), apply the sign target, and demand the reconstructed alpha lands within
+    # 90 deg of the GT heading on EVERY motion-labelled instance (axis is within 45 deg of true
+    # heading by construction, so the correct branch is always within 90 deg).
+    n_checked, worst = 0, 0.0
+    for k2 in list(ds_tr.by_segment):
+        for idx in ds_tr.by_segment[k2][:20]:
+            im2, sk2, _ = ds_tr.samples[idx]
+            anns2 = [a for a in ds_tr.anns_by_img[im2["id"]]
+                     if a.get("heading_valid", 0) and a.get("valid3D", True)]
+            if not anns2:
+                continue
+            t2 = ds_tr._targets(list(anns2), br_n, sk2, ds_tr.cache(sk2))
+            m2 = t2["sign_valid"] > 0
+            if not m2.any():
+                continue
+            psi_dec = 0.5 * torch.atan2(t2["axis_embed"][m2, 0], t2["axis_embed"][m2, 1])
+            a_rec = psi_dec + torch.pi * t2["sign_target"][m2]
+            a_gt = torch.tensor([float(a["heading_alpha"]) for a, mm in
+                                 zip(anns2, m2.tolist()) if mm])
+            dev = torch.atan2(torch.sin(a_rec - a_gt), torch.cos(a_rec - a_gt)).abs()
+            worst = max(worst, float(dev.max()))
+            n_checked += int(m2.sum())
+        if n_checked >= 300:
+            break
+    check("P16 orientation target/export round-trip", n_checked > 50 and worst < torch.pi / 2 + 1e-4,
+          f"{n_checked} labelled instances, worst |alpha_rec - alpha_gt| = "
+          f"{torch.rad2deg(torch.tensor(worst)):.1f} deg (must be < 90)")
+
     # P10: matcher determinism
     Q, C = 50, 6
     g = torch.Generator().manual_seed(0)
