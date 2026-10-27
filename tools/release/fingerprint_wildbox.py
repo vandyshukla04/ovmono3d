@@ -53,6 +53,30 @@ def fingerprint(path: Path) -> dict:
     core_sha = hashlib.sha256(
         json.dumps([core_imgs, core_anns], separators=(",", ":")).encode()).hexdigest()
 
+    # per-field digests: localize WHICH field differs between two copies with equal counts.
+    # paths canonicalized to the last 3 components (machine-independent join convention).
+    def h(obj):
+        return hashlib.sha256(json.dumps(obj, separators=(",", ":")).encode()).hexdigest()[:16]
+
+    def last3(p):
+        return "/".join(str(p).replace("\\", "/").split("/")[-3:])
+
+    imgs_s = sorted(d["images"], key=lambda im: im["id"])
+    anns_s = sorted(d["annotations"], key=lambda a: a["id"])
+    field_digests = {
+        "img_ids": h([im["id"] for im in imgs_s]),
+        "img_path_last3": h([[im["id"], last3(im.get("file_path", ""))] for im in imgs_s]),
+        "img_K": h([[im["id"], r6(im.get("K"))] for im in imgs_s]),
+        "ann_ids": h([a["id"] for a in anns_s]),
+        "ann_image_id": h([[a["id"], a["image_id"]] for a in anns_s]),
+        "ann_category": h([[a["id"], a.get("category_id")] for a in anns_s]),
+        "ann_bbox": h([[a["id"], r6(a.get("bbox"))] for a in anns_s]),
+        "ann_center_cam": h([[a["id"], r6(a.get("center_cam"))] for a in anns_s]),
+        "ann_dimensions": h([[a["id"], r6(a.get("dimensions"))] for a in anns_s]),
+        "ann_R_cam": h([[a["id"], r6(a.get("R_cam"))] for a in anns_s]),
+        "ann_behind_camera": h([[a["id"], bool(a.get("behind_camera", False))] for a in anns_s]),
+    }
+
     cls = Counter(a.get("category_name", str(a.get("category_id"))) for a in d["annotations"])
     ann0 = d["annotations"][0] if d["annotations"] else {}
     img0 = d["images"][0] if d["images"] else {}
@@ -72,6 +96,7 @@ def fingerprint(path: Path) -> dict:
         "stamp_fields_present": stamps,
         "valid3D_false_count": n_masked,
         "categories_block": [c.get("name") for c in d.get("categories", [])],
+        "field_digests": field_digests,
     }
 
 
@@ -94,6 +119,7 @@ def main() -> int:
         print(f"   per-class {r['per_class']}")
         print(f"   stamps {r['stamp_fields_present'] or 'none'}   "
               f"valid3D=false {r['valid3D_false_count']:,}")
+        print("   fields: " + "  ".join(f"{k}={v}" for k, v in r["field_digests"].items()))
     if args.out:
         args.out.write_text(json.dumps(reports, indent=1))
         print(f"\nreport -> {args.out}")
