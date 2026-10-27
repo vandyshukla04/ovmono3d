@@ -108,7 +108,8 @@ def render_segment(job):
                 n_drawn["omni"] += draw_cuboid(
                     f_omni, omni_corners(a["center_cam"], a["dimensions"], a["R_cam"]),
                     K, (40, 220, 40), EDGES_OMNI)
-            kitti_path = (Path(args.image_root) / group / video / seg / "kitti_labels"
+            kitti_root = Path(args.kitti_root) if args.kitti_root else Path(args.image_root)
+            kitti_path = (kitti_root / group / video / seg / "kitti_labels"
                           / fname.replace(".jpg", ".txt"))
             f_kitti = frame
             for k in parse_kitti(kitti_path):
@@ -146,6 +147,9 @@ def main() -> int:
     ap.add_argument("--only", type=str, default="")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--fps", type=int, default=10)
+    ap.add_argument("--kitti-root", type=str, default="",
+                    help="read kitti_labels from <root>/<group>/<video>/<seg>/kitti_labels "
+                         "instead of the image root (v1.1 QA: the regenerated channel)")
     args = ap.parse_args()
 
     segs = defaultdict(list)
