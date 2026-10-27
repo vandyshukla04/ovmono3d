@@ -190,8 +190,15 @@ def project_points(corners_cam: np.ndarray, K: np.ndarray) -> np.ndarray:
     return np.stack([u, v], axis=1)
 
 
-def discover_segments(sources: List[Source]) -> List[Dict]:
-    """Walk each source path and enumerate its <video>/<seg> subdirs."""
+def discover_segments(sources: List[Source], prefer_corrected: bool = False) -> List[Dict]:
+    """Walk each source path and enumerate its <video>/<seg> subdirs.
+
+    prefer_corrected: use vggt_results/annotations/tracking_summary.json (the human-corrected
+    generation: per-track constant dims, real class names, post-release fixes) when it exists,
+    falling back to the raw pipeline output otherwise. v1.0 was built WITHOUT this flag — that
+    is the export-source bug v1.1 fixes (release dims matched RAW cv digit-for-digit while the
+    corrected trees were already cv=0). Provenance is recorded per segment.
+    """
     segments = []
     for src in sources:
         if not src.path.exists():
@@ -205,6 +212,13 @@ def discover_segments(sources: List[Source]) -> List[Dict]:
                     continue
                 cameras_json = seg_dir / "vggt_results" / "cameras.json"
                 tracking_json = seg_dir / "vggt_results" / "tracking_summary.json"
+                tracking_provenance = "raw"
+                if prefer_corrected:
+                    corrected = (seg_dir / "vggt_results" / "annotations"
+                                 / "tracking_summary.json")
+                    if corrected.exists():
+                        tracking_json = corrected
+                        tracking_provenance = "corrected"
                 if not cameras_json.exists() or not tracking_json.exists():
                     logger.debug(f"Skipping incomplete segment: {seg_dir}")
                     continue
@@ -221,6 +235,7 @@ def discover_segments(sources: List[Source]) -> List[Dict]:
                     "seg_dir": seg_dir,
                     "cameras_json": cameras_json,
                     "tracking_json": tracking_json,
+                    "tracking_provenance": tracking_provenance,
                 })
     return segments
 
@@ -531,11 +546,13 @@ def build_split_json(
     segments: List[Dict],
     dataset_id: int,
     dataset_name: str,
+    dataset_version: str = "1.0",
 ) -> Tuple[Dict, Dict[str, float]]:
     """Build one Omni3D-style dict from a list of segment records."""
     images = []
     annotations = []
     scene_scales = {}
+    tracking_provenance = {}
     categories_seen: Dict[int, str] = {}
 
     next_image_id = 0
@@ -557,6 +574,7 @@ def build_split_json(
 
         s_scene = compute_scene_scale_cam(boxes_by_frame, frames_seq)
         scene_scales[seg["seg_id"]] = s_scene
+        tracking_provenance[seg["seg_id"]] = seg.get("tracking_provenance", "raw")
 
         for fseq in sorted(frames_seq.keys()):
             frame = frames_seq[fseq]
@@ -611,10 +629,11 @@ def build_split_json(
             "source": "wildbox",
             "name": dataset_name,
             "split": dataset_name.split("_")[-1],
-            "version": "1.0",
+            "version": dataset_version,
             "url": "",
             "known_category_ids": sorted(categories_seen.keys()),
             "scene_scales": scene_scales,
+            "tracking_provenance": tracking_provenance,
         },
         "categories": [
             {"id": cid, "name": categories_seen[cid], "supercategory": "animal"}
@@ -722,6 +741,12 @@ def parse_args():
                    default=Path("datasets/Omni3D/WildBox_val.json"))
     p.add_argument("--dataset-id", type=int, default=1000,
                    help="Omni3D dataset id for the info section")
+    p.add_argument("--prefer-corrected", action="store_true",
+                   help="Use vggt_results/annotations/tracking_summary.json (human-corrected) "
+                        "when present; fall back to raw. v1.1+ builds MUST pass this -- "
+                        "omitting it reproduces the v1.0 raw-source export bug.")
+    p.add_argument("--dataset-version", type=str, default="1.0",
+                   help="Written into info.version (v1.1 builds pass 1.1)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -749,7 +774,7 @@ def main():
     for s in sources:
         logger.info(f"Source: {s.path} -> {s.category_name} (id={s.category_id})")
 
-    all_segments = discover_segments(sources)
+    all_segments = discover_segments(sources, prefer_corrected=args.prefer_corrected)
     logger.info(f"Discovered {len(all_segments)} segments total")
     if not all_segments:
         sys.exit(2)
@@ -781,6 +806,7 @@ def main():
             segments=segs,
             dataset_id=args.dataset_id,
             dataset_name=f"WildBox_{split_name}",
+            dataset_version=args.dataset_version,
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
