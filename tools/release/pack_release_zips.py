@@ -85,11 +85,12 @@ def pack_video(job):
                     z.write(fp, f"{video}/{seg}/{fp.name}",
                             compress_type=zipfile.ZIP_STORED)
                     n_files += 1
-                # new kitti channel
-                kdir = Path(args.kitti_root) / alias / video / seg / "kitti_labels"
-                for kt in sorted(kdir.glob("*.txt")):
-                    z.write(kt, f"{video}/{seg}/kitti_labels/{kt.name}")
-                    n_files += 1
+                # new kitti channel (rectified labels + per-frame calib)
+                for sub in ("kitti_labels", "calib"):
+                    kdir = Path(args.kitti_root) / alias / video / seg / sub
+                    for kt in sorted(kdir.glob("*.txt")):
+                        z.write(kt, f"{video}/{seg}/{sub}/{kt.name}")
+                        n_files += 1
                 # full-res cameras + corrected tracking summary
                 cams = fullres_cameras(sp, frame_paths[0])
                 z.writestr(f"{video}/{seg}/cameras.json", json.dumps(cams, indent=1))
