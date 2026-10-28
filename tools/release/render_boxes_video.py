@@ -58,7 +58,11 @@ def kitti_corners(loc, h, w, l, ry):
 
 def draw_cuboid(img, c8, K, color, edges, thick=2):
     import cv2
-    uv = c8 @ np.asarray(K).T
+    P = np.asarray(K, float)
+    if P.shape == (3, 4):                       # KITTI P2: project homogeneous rect coords
+        uv = np.hstack([c8, np.ones((len(c8), 1))]) @ P.T
+    else:
+        uv = c8 @ P.T
     z = uv[:, 2]
     if (z <= 1e-6).any():
         return 0
@@ -111,6 +115,13 @@ def render_segment(job):
             kitti_root = Path(args.kitti_root) if args.kitti_root else Path(args.image_root)
             kitti_path = (kitti_root / group / video / seg / "kitti_labels"
                           / fname.replace(".jpg", ".txt"))
+            K_kitti = K
+            if args.kitti_calib:
+                cpath = kitti_root / group / video / seg / "calib" / fname.replace(".jpg", ".txt")
+                if cpath.exists():
+                    for line in cpath.read_text().splitlines():
+                        if line.startswith("P2:"):
+                            K_kitti = np.array([float(v) for v in line.split()[1:]]).reshape(3, 4)
             f_kitti = frame
             for k in parse_kitti(kitti_path):
                 x1, y1, x2, y2 = [int(v) for v in k["bbox"]]
@@ -118,7 +129,7 @@ def render_segment(job):
                 h, w, l = k["hwl"]
                 n_drawn["kitti"] += draw_cuboid(
                     f_kitti, kitti_corners(k["loc"], h, w, l, k["ry"]),
-                    K, (255, 220, 40), EDGES_KITTI)
+                    K_kitti, (255, 220, 40), EDGES_KITTI)
             for ch, f in (("omni", f_omni), ("kitti", f_kitti)):
                 cv2.putText(f, f"{ch.upper()} {group}/{video}/{seg} {fname}",
                             (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -147,6 +158,8 @@ def main() -> int:
     ap.add_argument("--only", type=str, default="")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--fps", type=int, default=10)
+    ap.add_argument("--kitti-calib", action="store_true",
+                    help="project kitti boxes with the per-frame calib P2 (rectified-frame labels)")
     ap.add_argument("--kitti-root", type=str, default="",
                     help="read kitti_labels from <root>/<group>/<video>/<seg>/kitti_labels "
                          "instead of the image root (v1.1 QA: the regenerated channel)")
